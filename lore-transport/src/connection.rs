@@ -281,6 +281,13 @@ pub async fn connect(
 ) -> Result<Arc<Connection>, ProtocolError> {
     let (remote_url, protocol) = parse(remote_url)?;
 
+    // A token the installation pinned replaces whatever the caller supplied, and
+    // no connection opens to any other server.
+    let (identity_token, access_token) = match crate::pinned::token_for(&remote_url)? {
+        Some(token) => (token, token),
+        None => (identity_token, access_token),
+    };
+
     // Try early out by reusing a known existing connection
     let identity = identity.to_string();
     let from_supplied_credentials = !identity_token.is_empty() || !access_token.is_empty();
@@ -701,7 +708,6 @@ async fn connect_impl(
 ///
 /// Empty strings mean the caller supplied nothing and credentials are resolved
 /// the usual way.
-#[derive(Debug)]
 pub struct SuppliedCredentials {
     tokens: parking_lot::RwLock<(String, String)>,
     /// Bumped whenever the pair changes, so the background refreshers can act on
@@ -712,6 +718,17 @@ pub struct SuppliedCredentials {
     /// single refresher, and `notify_waiters` would miss any that happened to be
     /// mid-exchange; a `watch` receiver keeps the pending change until it is read.
     generation: tokio::sync::watch::Sender<u64>,
+}
+
+impl std::fmt::Debug for SuppliedCredentials {
+    /// Names which credentials are present without printing them.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tokens = self.tokens.read();
+        f.debug_struct("SuppliedCredentials")
+            .field("identity_token", &(!tokens.0.is_empty()).then_some("<redacted>"))
+            .field("access_token", &(!tokens.1.is_empty()).then_some("<redacted>"))
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for SuppliedCredentials {

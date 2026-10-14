@@ -259,6 +259,11 @@ impl ServiceSettings {
 /// otherwise read the config file again to learn something that does not change
 /// underneath it.
 pub(crate) async fn service_in_use() -> bool {
+    // A pinned token stays in the process that read it: no command is relayed
+    // to a service, whatever the config or environment asks for.
+    if lore_transport::pinned::is_pinned() {
+        return false;
+    }
     if let Some(decided) = *SERVICE_IN_USE.read() {
         return decided;
     }
@@ -281,6 +286,11 @@ pub(crate) async fn service_in_use() -> bool {
 /// for the same reason, and fills the same answer [`service_in_use`] reads, so
 /// the file is read once either way.
 pub(crate) fn service_in_use_blocking() -> bool {
+    // A pinned token stays in the process that read it: no command is relayed
+    // to a service, whatever the config or environment asks for.
+    if lore_transport::pinned::is_pinned() {
+        return false;
+    }
     if let Some(decided) = *SERVICE_IN_USE.read() {
         return decided;
     }

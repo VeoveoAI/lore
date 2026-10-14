@@ -16,6 +16,7 @@ pub mod link;
 pub mod lock;
 pub mod log;
 pub mod notification;
+pub use lore_transport::pinned;
 pub mod remote;
 pub mod repository;
 pub mod revision;

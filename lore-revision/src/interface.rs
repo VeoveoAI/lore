@@ -843,13 +843,13 @@ impl LoreGlobalArgs {
     /// The authentication token supplied for this call, or an empty string when
     /// the credential comes from the token store as usual.
     pub fn identity_token(&self) -> &str {
-        self.identity_token.as_str()
+        lore_transport::pinned::token().unwrap_or(self.identity_token.as_str())
     }
 
     /// The authorization token supplied for this call, or an empty string when
     /// it is obtained by exchange as usual.
     pub fn access_token(&self) -> &str {
-        self.access_token.as_str()
+        lore_transport::pinned::token().unwrap_or(self.access_token.as_str())
     }
 
     /// Validates the global arguments. Can mutate the arguments after validation
@@ -859,9 +859,9 @@ impl LoreGlobalArgs {
 
         // The identity token names the identity when there is one; otherwise an
         // access token on its own does.
-        let (token, which) = if !self.identity_token.is_empty() {
+        let (token, which) = if !self.identity_token().is_empty() {
             (self.identity_token(), "identity token")
-        } else if !self.access_token.is_empty() {
+        } else if !self.access_token().is_empty() {
             (self.access_token(), "access token")
         } else {
             return Ok(());
