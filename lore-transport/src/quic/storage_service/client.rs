@@ -300,7 +300,15 @@ impl Storage for StorageClient {
             .await;
             authorization_token
         } else {
-            String::new()
+            // Without an auth service, present the token the caller supplied, as the
+            // gRPC services receive it. The server verifies it with the same JWT
+            // verifier and repository authorizer it applies to gRPC requests.
+            let (identity_token, access_token) = self.credentials.tokens();
+            if access_token.is_empty() {
+                identity_token
+            } else {
+                access_token
+            }
         };
         let token_bytes = token.as_bytes();
 
