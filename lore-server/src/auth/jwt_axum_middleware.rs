@@ -35,6 +35,14 @@ pub async fn jwt_axum_verify_authorization(
     if let Some(jwt_verifier) = state.jwt_verifier {
         if let Some(accesstoken) = extract_bearer_token(&request) {
             if let Ok(user_info) = jwt_verifier.verify_token(&accesstoken).await {
+                // This opt-in capability is qualified only for gRPC. HTTP mutation
+                // routes must not become a second path around branch checks.
+                if user_info.extra.contains_key(crate::auth::authoring::CLAIM) {
+                    return Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(Body::empty())
+                        .unwrap();
+                }
                 let repository: lore_revision::lore::RepositoryId =
                     Context::from_str(params.repository_id.as_str())
                         .unwrap_or_default()

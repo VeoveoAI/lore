@@ -148,10 +148,24 @@ where
 
         Box::pin(async move {
             let mut request = request;
-            let repository = match named_partition(request.headers()) {
-                Ok(Some(repository)) => repository,
-                Ok(None) => return inner.call(request).await,
+            let named = match named_partition(request.headers()) {
+                Ok(named) => named,
                 Err(status) => return Ok(status.into_http()),
+            };
+            let write = if let Some(token) = request
+                .extensions()
+                .get::<crate::auth::jwt::AuthorizationToken>()
+            {
+                match crate::auth::authoring::rpc_access(token, request.uri().path(), named) {
+                    Ok(write) => write,
+                    Err(status) => return Ok(status.into_http()),
+                }
+            } else {
+                false
+            };
+            let repository = match named {
+                Some(repository) => repository,
+                None => return inner.call(request).await,
             };
 
             // Authorization denials are flattened to `Denied` inside the
@@ -163,6 +177,14 @@ where
                 let extensions = request.extensions();
                 tokio::time::timeout(authorization_timeout, async move {
                     let token = get_verified_token(extensions);
+                    if write
+                        && authorizer
+                            .check_repository_access(token.as_ref(), repository, Some("write"))
+                            .await
+                            .is_err()
+                    {
+                        return Access::Denied;
+                    }
                     match authorizer.granted_access(token.as_ref(), repository).await {
                         Ok(grants) => Access::Granted(grants.filter(|_| token.is_some())),
                         Err(_denied) => Access::Denied,

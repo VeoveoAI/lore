@@ -181,6 +181,39 @@ async fn a_permitted_partition_reaches_the_service() {
     );
 }
 
+#[tokio::test]
+async fn scoped_upload_requires_write_permission_and_raw_mutation_never_reaches_handler() {
+    let authorizer = RecordingAuthorizer::new(true);
+    let (mut service, inner) =
+        service_with(PartitionAccessLayer::new(authorizer.clone(), TEST_TIMEOUT));
+    let mut req = request(Some(repository()), true);
+    *req.uri_mut() = "/lore.storage.v1.StorageService/Put".parse().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let token = req
+        .extensions_mut()
+        .get_mut::<AuthorizationToken>()
+        .unwrap();
+    token.issued_at = now;
+    token.expires = now + 30;
+    token.extra.insert(lore_server::auth::authoring::CLAIM.into(), serde_json::json!({"version":1,"repository":repository().to_string(),"branch":"0194b726b34e72b0b45550b88a967077"}));
+    let mut raw = request(Some(repository()), true);
+    *raw.uri_mut() = "/lore.storage.v1.StorageService/MutableStore"
+        .parse()
+        .unwrap();
+    raw.extensions_mut().insert(token.clone());
+    service.call(req).await.unwrap();
+    assert_eq!(inner.calls(), 1);
+    assert_eq!(authorizer.asked()[0].2.as_deref(), Some("write"));
+    assert_eq!(
+        status_of(&service.call(raw).await.unwrap()).code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(inner.calls(), 1);
+}
+
 /// A request naming no partition gets no decision, not a check against
 /// the zero partition id.
 #[tokio::test]

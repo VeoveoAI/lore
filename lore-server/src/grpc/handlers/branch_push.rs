@@ -92,6 +92,11 @@ pub async fn handler(
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository = get_repository(request.metadata())?;
+    crate::auth::authoring::branch_access(
+        request.extensions(),
+        repository,
+        request.get_ref().branch.clone().into(),
+    )?;
 
     // TODO(mjansson): Once we have authz permission model with read/write/admin
     // this should be upgraded to check for the correct permission rather than

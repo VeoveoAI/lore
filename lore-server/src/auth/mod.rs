@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub mod authoring;
+pub mod authoring_lifetime;
 pub mod jwk;
 pub mod jwt;
 pub mod jwt_axum_middleware;

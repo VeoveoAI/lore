@@ -646,10 +646,14 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         jwt_interceptor: &JWTInterceptor,
         authorizer: &Arc<dyn RepositoryAuthorizer>,
         authorization_timeout: Duration,
-    ) -> tonic::service::interceptor::InterceptedService<PartitionAccessService<S>, JWTInterceptor>
-    {
+    ) -> tonic::service::interceptor::InterceptedService<
+        crate::auth::authoring_lifetime::AuthoringLifetimeService<PartitionAccessService<S>>,
+        JWTInterceptor,
+    > {
         tonic::service::interceptor::InterceptedService::new(
-            PartitionAccessLayer::new(authorizer.clone(), authorization_timeout).layer(service),
+            crate::auth::authoring_lifetime::AuthoringLifetimeService(
+                PartitionAccessLayer::new(authorizer.clone(), authorization_timeout).layer(service),
+            ),
             jwt_interceptor.clone(),
         )
     }
@@ -835,16 +839,18 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         }
         if check_enabled(&services.repository_service, "repository_service") {
             router = router
-                .add_service(RepositoryServiceServer::with_interceptor(
-                    repository_svc,
-                    jwt_interceptor.clone(),
+                .add_service(Self::partition_scoped(
+                    RepositoryServiceServer::new(repository_svc),
+                    &jwt_interceptor,
+                    &repository_authorizer,
+                    authorization_timeout,
                 ))
-                .add_service(
-                    repository_v1_server::RepositoryServiceServer::with_interceptor(
-                        repository_v1_svc,
-                        jwt_interceptor.clone(),
-                    ),
-                );
+                .add_service(Self::partition_scoped(
+                    repository_v1_server::RepositoryServiceServer::new(repository_v1_svc),
+                    &jwt_interceptor,
+                    &repository_authorizer,
+                    authorization_timeout,
+                ));
         }
         if check_enabled(&services.environment_service, "environment_service") {
             router = router
@@ -867,12 +873,12 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         if let Some(notification_service) = notification_service
             && check_enabled(&services.notification_service, "notification_service")
         {
-            router = router.add_service(
-                lore_notification::NotificationServiceServer::with_interceptor(
-                    notification_service,
-                    jwt_interceptor.clone(),
-                ),
-            );
+            router = router.add_service(Self::partition_scoped(
+                lore_notification::NotificationServiceServer::new(notification_service),
+                &jwt_interceptor,
+                &repository_authorizer,
+                authorization_timeout,
+            ));
         }
 
         info!(
