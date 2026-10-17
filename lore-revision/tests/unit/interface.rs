@@ -188,6 +188,17 @@ fn access_token_naming_no_identity_is_rejected() {
 }
 
 #[test]
+fn opaque_access_token_uses_the_explicit_identity() {
+    let mut globals = LoreGlobalArgs {
+        identity: "factory".into(),
+        access_token: "openshell:resolve:env:LORE_AUTH_TOKEN".into(),
+        ..Default::default()
+    };
+    assert!(globals.validate().is_ok());
+    assert_eq!(globals.identity.as_str(), "factory");
+}
+
+#[test]
 fn identity_and_access_token_are_mutually_exclusive() {
     let mut globals = LoreGlobalArgs {
         identity: "alice".into(),

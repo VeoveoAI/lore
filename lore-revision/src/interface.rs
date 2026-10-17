@@ -857,6 +857,20 @@ impl LoreGlobalArgs {
     pub fn validate(&mut self) -> Result<(), InvalidArguments> {
         let invalid = |reason: String| Err(InvalidArguments { reason });
 
+        // OAuth bearer credentials may be opaque, including handles resolved by
+        // a trusted transport. They cannot describe the local identity. Require
+        // the caller to name it explicitly; the remote still authenticates and
+        // authorizes the bearer independently. Preserve JWT identity validation.
+        if self.identity_token.is_empty()
+            && !self.access_token.is_empty()
+            && lore_credential::identity_from_token(self.access_token()).is_empty()
+        {
+            if self.identity.is_empty() {
+                return invalid("an opaque access token requires an explicit identity".to_string());
+            }
+            return Ok(());
+        }
+
         // The identity token names the identity when there is one; otherwise an
         // access token on its own does.
         let (token, which) = if !self.identity_token.is_empty() {

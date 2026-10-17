@@ -83,8 +83,8 @@ pub struct LoreCli {
     pub identity_token: Option<String>,
 
     /// Use given authorization token instead of exchanging one with the
-    /// authentication service
-    #[clap(global = true, long, value_name = "token", conflicts_with = "identity")]
+    /// authentication service. Opaque tokens require --identity.
+    #[clap(global = true, long, value_name = "token")]
     pub access_token: Option<String>,
 
     /// Avoid using compression
