@@ -110,6 +110,10 @@ name = "loreserver"
 # The binary holds no unit tests; the library it drives does.
 test = false
 
+[[example]]
+name = "factory_branch_fixture"
+path = "tests/fixtures/factory_branch_seed.rs"
+
 [lib]
 name = "lore_server"
 test = false

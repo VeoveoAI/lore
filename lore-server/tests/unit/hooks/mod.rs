@@ -3,6 +3,7 @@
 
 mod context;
 mod dispatch;
+mod factory_branch;
 #[cfg(test)]
 mod integration_tests;
 mod registry;
