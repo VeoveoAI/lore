@@ -92,14 +92,6 @@ impl Message for Connect {
                         raw: auth_token,
                         claims: &authorization,
                     };
-                    if authorization
-                        .extra
-                        .contains_key(crate::auth::authoring::CLAIM)
-                    {
-                        return Err(MessageHandleError::AuthorizationFailure(
-                            "Authoring grants require mediated gRPC".into(),
-                        ));
-                    }
                     let grants = repository_authorizer
                         .granted_access(Some(&token), self.repository)
                         .await

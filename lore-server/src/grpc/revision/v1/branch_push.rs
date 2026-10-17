@@ -73,11 +73,6 @@ pub async fn handler(
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository_id = get_repository(request.metadata())?;
-    crate::auth::authoring::branch_access(
-        request.extensions(),
-        repository_id,
-        request.get_ref().id.clone().into(),
-    )?;
 
     // Service accounts bypass branch-protection (mirroring path).
     let mut bypass_protection = false;
