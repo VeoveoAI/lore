@@ -45,7 +45,7 @@ fn assigned_push_is_admitted_and_other_push_explains_both_branches() {
     let error = hook
         .pre_handler(&context("factory-one", REPO, OTHER))
         .unwrap_err();
-    assert_eq!(error.status_code(), Some(StatusCode::PermissionDenied));
+    assert_eq!(error.status_code(), Some(StatusCode::FailedPrecondition));
     assert!(error.to_string().contains(&format!(
         "This factory is assigned to branch {ASSIGNED}; attempted push to branch {OTHER}."
     )));
@@ -166,7 +166,7 @@ async fn both_existing_push_handlers_invoke_the_guard_with_verified_identity() {
             )
             .await
             .unwrap_err();
-            assert_eq!(error.code(), tonic::Code::PermissionDenied);
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
             assert!(error.message().contains(&format!(
                 "assigned to branch {ASSIGNED}; attempted push to branch {OTHER}"
             )));
@@ -191,7 +191,7 @@ async fn both_existing_push_handlers_invoke_the_guard_with_verified_identity() {
             )
             .await
             .unwrap_err();
-            assert_eq!(error.code(), tonic::Code::PermissionDenied);
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
             assert!(error.message().contains(&format!(
                 "assigned to branch {ASSIGNED}; attempted push to branch {OTHER}"
             )));

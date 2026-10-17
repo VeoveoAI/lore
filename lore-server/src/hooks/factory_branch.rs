@@ -72,7 +72,9 @@ impl Hook for FactoryBranchHook {
         Err(HookError::rejected(
             NAME,
             message,
-            StatusCode::PermissionDenied,
+            // A workflow precondition, not a replacement authorization layer.
+            // Ordinary clients preserve the message for this existing status.
+            StatusCode::FailedPrecondition,
         ))
     }
 }

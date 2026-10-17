@@ -24,7 +24,9 @@ never set `is_service_account` just because the caller is automated.
 
 The check compares stable repository and branch IDs, so a branch rename does not
 change its assignment. A rejected push names the assigned and attempted branch
-IDs. Identities absent from `assignments`, including normal human users, keep their
+IDs. The hook uses the existing `FailedPrecondition` business-rule rejection so
+ordinary Lore clients retain the explanatory message (`PermissionDenied` is
+rendered as a generic authorization error by the stock client). Identities absent from `assignments`, including normal human users, keep their
 existing permissions. An admitted push still passes through native branch
 protection and the ordinary push/merge implementation.
 
