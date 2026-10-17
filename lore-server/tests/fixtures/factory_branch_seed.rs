@@ -48,6 +48,21 @@ fn main() -> anyhow::Result<()> {
         for (id, name) in [(assigned, "assigned"), (other, "other-author")] {
             branch::create(context.clone(), &get_write_token(), id, name, branch::default_category(), "fixture-operator", 1, vec![], false, false).await?;
         }
+        // Branch metadata alone has no cloneable head. Seed ordinary empty
+        // revisions before protecting main, using the same native push helper.
+        for id in [main, assigned, other] {
+            let mut metadata = lore_revision::metadata::Metadata::new();
+            metadata.set_branch(id)?;
+            let metadata_hash = metadata.serialize(context.clone()).await?;
+            let state = lore_revision::state::State::new();
+            state.set_revision_number(1);
+            state.set_metadata_hash(metadata_hash);
+            let revision = state.serialize(context.clone(), &get_write_token()).await?;
+            lore_server::grpc::handlers::branch_push::push(
+                context.clone(), id, revision, false, false, false,
+                branch::DEFAULT_HISTORY_STEP_SIZE, Default::default(),
+            ).await?;
+        }
         branch::protect(context, main).await?;
         immutable.flush(true).await?;
         mutable.flush(true).await?;
