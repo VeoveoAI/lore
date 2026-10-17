@@ -503,19 +503,23 @@ async fn auth_exchange_for_identity(
     identity_token: &str,
     access_token: &str,
 ) -> (String, String, String) {
-    let authentication_token = token_store::load_user_token(
-        auth_url,
-        identity,
-        tokens_only_for_recipient_domain(remote_domain.to_string()),
-        identity_token,
-        access_token,
-    )
-    .await
-    .unwrap_or_default();
+    // An explicitly supplied access token is also the bearer for discovery
+    // services such as RepositoryGet. Those services authenticate and enforce
+    // its grants on the server; do not read an unrelated identity from storage.
+    let authentication_token = if !access_token.is_empty() {
+        access_token.to_string()
+    } else {
+        token_store::load_user_token(
+            auth_url,
+            identity,
+            tokens_only_for_recipient_domain(remote_domain.to_string()),
+            identity_token,
+            access_token,
+        )
+        .await
+        .unwrap_or_default()
+    };
 
-    // A supplied access token authorizes on its own, so carry on without an
-    // authentication token: the services that need one fail where they use it,
-    // and the ones that only need authorization still work.
     if authentication_token.is_empty() && access_token.is_empty() {
         lore_debug!("Auth exchange failed, no user authentication token found for {identity}");
         return (String::new(), String::new(), String::new());
@@ -664,19 +668,23 @@ async fn auth_exchange_custom_resource_for_identity(
     identity_token: &str,
     access_token: &str,
 ) -> (String, String, String) {
-    let authentication_token = token_store::load_user_token(
-        auth_url,
-        identity,
-        tokens_only_for_recipient_domain(remote_domain.to_string()),
-        identity_token,
-        access_token,
-    )
-    .await
-    .unwrap_or_default();
+    // An explicitly supplied access token is also the bearer for discovery
+    // services such as RepositoryGet. Those services authenticate and enforce
+    // its grants on the server; do not read an unrelated identity from storage.
+    let authentication_token = if !access_token.is_empty() {
+        access_token.to_string()
+    } else {
+        token_store::load_user_token(
+            auth_url,
+            identity,
+            tokens_only_for_recipient_domain(remote_domain.to_string()),
+            identity_token,
+            access_token,
+        )
+        .await
+        .unwrap_or_default()
+    };
 
-    // A supplied access token authorizes on its own, so carry on without an
-    // authentication token: the services that need one fail where they use it,
-    // and the ones that only need authorization still work.
     if authentication_token.is_empty() && access_token.is_empty() {
         lore_debug!("Auth exchange failed, no user authentication token found for {identity}");
         return (String::new(), String::new(), String::new());

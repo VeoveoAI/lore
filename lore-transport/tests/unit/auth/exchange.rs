@@ -31,12 +31,10 @@ async fn supplied_access_token_replaces_the_resource_exchange() {
     assert_eq!(token, "supplied-authz");
 }
 
-/// An access token on its own authorizes without an authentication token to
-/// trade in, and without reading one from the store. The authentication slot
-/// comes back empty, so the services that need one fail where they use it
-/// while the authorized ones still work.
+/// An access token on its own is the bearer for both discovery and repository
+/// calls, without reading an unrelated identity token from the store.
 #[tokio::test]
-async fn access_token_alone_authorizes_without_an_authentication_token() {
+async fn access_token_alone_authenticates_discovery_and_authorizes_repository_calls() {
     let repository: RepositoryId = "00112233445566778899aabbccddeeff"
         .parse()
         .expect("a valid repository id");
@@ -50,10 +48,7 @@ async fn access_token_alone_authorizes_without_an_authentication_token() {
     )
     .await;
 
-    assert!(
-        authentication_token.is_empty(),
-        "no authentication token is invented, and none is read from the store"
-    );
+    assert_eq!(authentication_token, "supplied-authz");
     assert_eq!(authorization_token, "supplied-authz");
     assert_eq!(identity, "alice");
 }
@@ -270,4 +265,38 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
         2,
         "the second credential must not be served the first one's entry"
     );
+}
+
+#[tokio::test]
+async fn opaque_access_token_authenticates_repository_discovery_without_exchange() {
+    let placeholder = "openshell:resolve:env:LORE_AUTH_TOKEN";
+    let (authentication, authorization, identity) = auth_exchange(
+        "ucs-auth://unreachable.invalid",
+        "example.com",
+        "factory",
+        RepositoryId::default(),
+        "",
+        placeholder,
+    )
+    .await;
+    assert_eq!(authentication, placeholder);
+    assert!(authorization.is_empty());
+    assert_eq!(identity, "factory");
+}
+
+#[tokio::test]
+async fn opaque_access_token_authenticates_custom_resource_calls_without_exchange() {
+    let placeholder = "openshell:resolve:env:LORE_AUTH_TOKEN";
+    let (authentication, authorization, identity) = auth_exchange_custom_resource(
+        "ucs-auth://unreachable.invalid",
+        "example.com",
+        "factory",
+        "custom-resource",
+        "",
+        placeholder,
+    )
+    .await;
+    assert_eq!(authentication, placeholder);
+    assert_eq!(authorization, placeholder);
+    assert_eq!(identity, "factory");
 }
