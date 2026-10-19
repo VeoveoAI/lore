@@ -38,6 +38,9 @@ pub type LoreArray<T> = lore_revision::interface::LoreArray<T>;
 
 /// Named by `lore_repository_create_args_t::use_shared_store`; re-exported so callers need no
 /// dependency on `lore_revision`.
+pub use lore_revision::auth::AuthMode;
+pub use lore_revision::auth::AuthPath;
+pub use lore_revision::auth::UnknownAuthMode;
 pub use lore_revision::repository::LoreSharedStoreMode;
 
 use crate::call_delegation::dispatch_command;
@@ -85,6 +88,8 @@ pub type LoreLinkBranchCreateEventData = lore_revision::link::LoreLinkBranchCrea
 pub type LoreFragmentWriteEventData = lore_revision::immutable::LoreFragmentWriteEventData;
 pub type LoreCompleteEventData = lore_revision::event::LoreCompleteEventData;
 pub type LoreMaintenanceEventData = lore_revision::event::LoreMaintenanceEventData;
+pub type LoreServiceStatusEventData = lore_revision::event::LoreServiceStatusEventData;
+pub type LoreServiceMessageEventData = lore_revision::event::LoreServiceMessageEventData;
 
 pub mod metadata {
     pub const MESSAGE: &str = lore_revision::metadata::MESSAGE;
@@ -385,7 +390,8 @@ pub type LoreAuthLoginInteractiveArgs = crate::auth::LoreAuthLoginInteractiveArg
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested |
+/// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
+/// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
 /// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_auth_login_interactive(
@@ -417,7 +423,8 @@ pub extern "C" fn lore_auth_login_interactive(
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested |
+/// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
+/// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
 /// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_auth_login_interactive_async(
@@ -3992,6 +3999,12 @@ pub type LoreRepositoryCloneArgs = crate::repository::LoreRepositoryCloneArgs;
 
 /// Clone a remote repository to a local path.
 ///
+/// A clone needs the remote, so the `offline` global argument does not keep it from connecting: it
+/// prepares the clone for working offline instead. With `offline` or `cache`, a clone that writes
+/// its files caches every file metadata block of the cloned revision, which staging and committing
+/// write to, so both work without the remote, and fails if it cannot. A bare clone writes no files
+/// and reads them from the remote when a call needs them.
+///
 /// # Events
 ///
 /// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
@@ -4013,7 +4026,7 @@ pub type LoreRepositoryCloneArgs = crate::repository::LoreRepositoryCloneArgs;
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when clone begins, includes remote URL and target path |
 /// | `LORE_EVENT_REPOSITORY_CLONE_PROGRESS` | `lore_repository_clone_progress_event_data_t` | Emitted periodically during clone with progress data |
-/// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when clone completes successfully |
+/// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted only when the clone succeeds; `LORE_EVENT_COMPLETE` reports the outcome of every clone |
 /// | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted after resolving the target revision to sync during clone |
 /// | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file written during initial sync |
 /// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during initial file sync |
@@ -4052,7 +4065,7 @@ pub extern "C" fn lore_repository_clone(
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when clone begins, includes remote URL and target path |
 /// | `LORE_EVENT_REPOSITORY_CLONE_PROGRESS` | `lore_repository_clone_progress_event_data_t` | Emitted periodically during clone with progress data |
-/// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when clone completes successfully |
+/// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted only when the clone succeeds; `LORE_EVENT_COMPLETE` reports the outcome of every clone |
 /// | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted after resolving the target revision to sync during clone |
 /// | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file written during initial sync |
 /// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during initial file sync |
@@ -6779,12 +6792,17 @@ pub type LoreStorageGetResolvedArgs = crate::storage::get_resolved::LoreStorageG
 /// materialised in memory before the first byte reaches the callback, so a key naming something
 /// large should set it.
 ///
+/// Set `fragments` to receive one `LORE_EVENT_STORAGE_GET_FRAGMENT` per leaf fragment in place of
+/// `LORE_EVENT_STORAGE_GET_DATA`, each carrying the leaf's `lore_fragment_t` and its payload as
+/// stored. No leaf is expanded or checked against its hash.
+///
 /// # Events
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_STORAGE_GET_HEADER` | `lore_storage_get_header_event_data_t` | Size of the item's reassembled content, emitted before any DATA events |
 /// | `LORE_EVENT_STORAGE_GET_DATA` | `lore_storage_get_data_event_data_t` | Payload bytes — valid only during the callback invocation. One event per item, or one per leaf fragment when `streaming` is set |
+/// | `LORE_EVENT_STORAGE_GET_FRAGMENT` | `lore_storage_get_fragment_event_data_t` | One leaf fragment and its payload, in content order, when `fragments` is set. The payload is valid only during the callback invocation |
 /// | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event |
 /// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
@@ -7394,7 +7412,9 @@ pub type LoreServiceStopArgs = crate::service::LoreServiceStopArgs;
 /// Stop the running Lore background service.
 ///
 /// Does not start a service in order to stop one. Returns `0` when no service
-/// is running, since that is the state the call asks for.
+/// is running, since that is the state the call asks for. A mount the service
+/// cannot release because something holds it refuses the stop with `MountsBusy`,
+/// unless the global `force` argument is set, which detaches busy mounts lazily.
 ///
 /// # Events
 ///
@@ -7442,6 +7462,79 @@ pub extern "C" fn lore_service_stop_async(
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, invoke_locally);
+}
+
+pub type LoreServiceStatusArgs = crate::service::LoreServiceStatusArgs;
+
+/// Report whether the Lore background service is running, and its metadata.
+///
+/// Answers from inside the service when called there, and otherwise reaches the
+/// one that is listening. Nothing listening is an answer rather than a failure:
+/// the call returns `0` with `running` set to `0`, so a caller branches on the
+/// event rather than on a connection error. Also hands back the log messages the
+/// service buffered while no command was running, emptying the buffer as it
+/// reads it.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+///
+/// ## Operation-Specific Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_SERVICE_STATUS` | `lore_service_status_event_data_t` | Service running state and metadata |
+/// | `LORE_EVENT_SERVICE_MESSAGE` | `lore_service_message_event_data_t` | A log message the service buffered outside command execution |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_service_status(
+    globals: &LoreGlobalArgs,
+    args: &LoreServiceStatusArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Asynchronous version of `lore_service_status`.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+///
+/// ## Operation-Specific Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_SERVICE_STATUS` | `lore_service_status_event_data_t` | Service running state and metadata |
+/// | `LORE_EVENT_SERVICE_MESSAGE` | `lore_service_message_event_data_t` | A log message the service buffered outside command execution |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_service_status_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreServiceStatusArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
 }
 
 pub type LoreServiceSetExecutableArgs = crate::service::LoreServiceSetExecutableArgs;
@@ -7705,7 +7798,10 @@ pub extern "C" fn lore_log_configure(config: &LoreLogConfig) -> i32 {
 }
 
 /// Shut the library down, stopping its worker threads and releasing the
-/// resources it holds. Call this once, when no further calls will be made.
+/// resources it holds. Call this once, when no further calls will be made and
+/// every call made has completed. The library makes a best effort to cancel
+/// calls still executing safely, but a call it does not stop in time may still
+/// use the memory passed to it after this returns.
 ///
 /// Returns 0 on success and a non-zero value on failure.
 #[unsafe(no_mangle)]

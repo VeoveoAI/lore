@@ -664,6 +664,7 @@ fn build_lore_http_settings(
     user_agent_filter: Arc<UserAgentFilter>,
 ) -> LoreHttpServerSettings {
     LoreHttpServerSettings {
+        health_only: http_settings.health_only,
         port: http_settings.port,
         host: http_settings.host.clone(),
         max_file_size: http_settings.max_file_size,
@@ -1485,10 +1486,12 @@ async fn configure_composite_store(
 ) -> Result<Arc<dyn ImmutableStore>> {
     info!("Wiring up Composite store");
 
-    let mut composite_store_builder = CompositeStoreBuilder::default().with_cache_metadata(
-        settings.cache_metadata.unwrap_or_default(),
-        settings.cache_metadata_semaphore_size,
-    );
+    let mut composite_store_builder = CompositeStoreBuilder::default()
+        .with_cache_metadata(
+            settings.cache_metadata.unwrap_or_default(),
+            settings.cache_metadata_semaphore_size,
+        )
+        .with_record_copy_out_of_band(settings.record_copy_out_of_band);
 
     let store = Box::pin(configure_composite_substore(
         registry,
@@ -2063,7 +2066,6 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 jwt_issuer: Some(auth.jwt_issuer.clone()),
                 jwt_audience: Some(auth.jwt_audience.clone()),
                 jwt_typ: auth.jwt_typ.clone(),
-                identity_claim: auth.identity_claim.clone(),
             })
         }
         None => None,

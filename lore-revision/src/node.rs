@@ -29,6 +29,7 @@ use crate::immutable::ImmutableError;
 use crate::immutable::ReadBoxFromImmutable;
 use crate::interface::LoreNodeStagedAction;
 use crate::interface::LoreNodeType;
+use crate::link::LinkedState;
 use crate::lore::Address;
 use crate::lore::CloneHeapAlloc;
 use crate::lore::Hash;
@@ -36,8 +37,10 @@ use crate::lore::RepositoryId;
 use crate::lore::ZeroHeapAlloc;
 use crate::lore_debug;
 use crate::lore_trace;
+use crate::lore_warn;
 use crate::node;
 use crate::repository::RepositoryContext;
+use crate::repository::is_reserved_node_name;
 use crate::state::State;
 use crate::state::StateError;
 
@@ -1068,10 +1071,18 @@ pub enum NodeNameError {
     Oversized,
 }
 
+/// The content rules a name is held to on both the read and the write path: no traversal, no
+/// separator, no leading NUL, and not the repository's own directory in any ASCII case.
 fn validate_node_name(name: &str) -> Result<(), NodeNameError> {
     if name == ".." || name.starts_with('\0') || name.bytes().any(|b| b == b'/' || b == b'\\') {
         return Err(InvalidArguments {
             reason: format!("invalid node name: {name}"),
+        }
+        .into());
+    }
+    if is_reserved_node_name(name) {
+        return Err(InvalidArguments {
+            reason: format!("reserved node name: {name}"),
         }
         .into());
     }
@@ -1252,7 +1263,26 @@ impl NodeBlock {
     /// Callers must drop the returned value before calling `write()` on the same block,
     /// or the write lock acquisition will deadlock.
     pub fn node_name_ref(&self, node_index: usize) -> Result<NodeNameLock, NodeNameError> {
+        Self::name_lock(self.data.read_arc(), node_index)
+    }
+
+    /// A copy of a node and its name, both read under one read lock, which the name keeps
+    /// held; see [`Self::node_name_ref`].
+    pub fn node_and_name_ref(
+        &self,
+        node_index: usize,
+    ) -> (Node, Result<NodeNameLock, NodeNameError>) {
         let guard = self.data.read_arc();
+        let node = guard.data.node[node_index];
+        (node, Self::name_lock(guard, node_index))
+    }
+
+    /// The name of the node at `node_index`, read from the name table `guard` holds, which the
+    /// name keeps held.
+    fn name_lock(
+        guard: parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, NodeBlockRuntimeData>,
+        node_index: usize,
+    ) -> Result<NodeNameLock, NodeNameError> {
         let node = &guard.data.node[node_index];
         let offset = node.name_offset as usize;
         let length = node.name_length as usize;
@@ -1273,6 +1303,32 @@ impl NodeBlock {
             name,
             _guard: guard,
         })
+    }
+
+    /// [`Self::node_name_ref`], answering `None` for a node whose name the read path refuses,
+    /// logged as the node being skipped under `node_id`.
+    ///
+    /// A walk that lists or materializes content stands on this, so a name no node may carry
+    /// reaches neither disk nor a listing, and the walk carries on past the node. A name that
+    /// cannot be read at all is still an error.
+    ///
+    /// As with [`Self::node_name_ref`], the returned `NodeNameLock` holds a read lock on the
+    /// block data for its lifetime. Callers must drop it before calling `write()` on the same
+    /// block, or the write lock acquisition will deadlock. Nothing is held when the answer is
+    /// `None`.
+    pub fn node_name_ref_or_skip(
+        &self,
+        node_index: usize,
+        node_id: NodeID,
+    ) -> Result<Option<NodeNameLock>, NodeNameError> {
+        match self.node_name_ref(node_index) {
+            Ok(name) => Ok(Some(name)),
+            Err(err) if err.is_invalid_arguments() => {
+                lore_warn!("Skipping node {node_id} with invalid name: {err}");
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn deserialize_nametable(
@@ -1676,6 +1732,19 @@ impl NodeBlockWriter<'_> {
         prev_length: u32,
     ) -> Result<(u32, u32), NodeNameError> {
         validate_node_name_for_store(name)?;
+        self.node_name_store_unchecked(name, prev_offset, prev_length)
+    }
+
+    /// [`Self::node_name_store`] without the name rules. Only a test has a use for it: a
+    /// name table written before a rule existed can hold a name the rule refuses, and the
+    /// read path has to be shown refusing or skipping such a node.
+    #[lore_macro::test_pub]
+    fn node_name_store_unchecked(
+        &mut self,
+        name: &str,
+        prev_offset: u32,
+        prev_length: u32,
+    ) -> Result<(u32, u32), NodeNameError> {
         let prev_offset = prev_offset as usize;
         let prev_length = prev_length as usize;
         if name.len() <= prev_length && (prev_offset + prev_length) < self.lock.name.len() {
@@ -1781,12 +1850,20 @@ impl NodeLink {
         if self.is_valid_or_root()
             && (repository.id != self.repository || state.revision() != self.revision)
         {
-            let repository = repository.to_link_context(self.repository).await;
-            let state = State::deserialize(repository.clone(), self.revision).await?;
-            Ok((repository, state))
+            self.open(&repository).await
         } else {
             Ok((repository, state))
         }
+    }
+
+    /// The repository and revision state this link names, reached from `repository`.
+    pub async fn open(
+        &self,
+        repository: &Arc<RepositoryContext>,
+    ) -> Result<LinkedState, StateError> {
+        let repository = repository.to_link_context(self.repository).await;
+        let state = State::deserialize(repository.clone(), self.revision).await?;
+        Ok((repository, state))
     }
 }
 

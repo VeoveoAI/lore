@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use lore_base::env::CallEnvironment;
 use lore_base::error::RepositoryNotFound;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::FfiError;
@@ -28,14 +29,29 @@ use crate::interface::LoreEventCallback;
 use crate::util::log_command_done;
 use crate::util::log_command_info;
 
+tokio::task_local! {
+    /// The environment of the process a call running in this task was relayed from.
+    static RELAYED_ENVIRONMENT: CallEnvironment;
+}
+
+/// Runs `call`, relayed from a process with `environment`, so that the execution context it sets
+/// up reads that environment in place of this process's.
+pub(crate) fn with_relayed_environment<F: Future>(
+    environment: CallEnvironment,
+    call: F,
+) -> impl Future<Output = F::Output> {
+    RELAYED_ENVIRONMENT.scope(environment, call)
+}
+
 pub fn setup_execution(
     globals: LoreGlobalArgs,
     callback: LoreEventCallback,
 ) -> Arc<ExecutionContext> {
-    Arc::new(ExecutionContext::new_client(
-        globals,
-        EventDispatcher::new(callback),
-    ))
+    let execution = ExecutionContext::new_client(globals, EventDispatcher::new(callback));
+    Arc::new(match RELAYED_ENVIRONMENT.try_with(Clone::clone) {
+        Ok(environment) => execution.with_environment(environment),
+        Err(_) => execution,
+    })
 }
 
 /// Read-only repository call. No `RepositoryWriteToken` is minted, so
@@ -90,7 +106,7 @@ where
                     Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                 };
                 let detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
-                (detail, Some(post_command_cleanup(repository).await))
+                (detail, Some(post_command_cleanup(repository)))
             };
 
             check_no_lingering_repository(weak_repository);
@@ -147,7 +163,7 @@ where
                 };
                 let detail =
                     LoreErrorDetail::from_result(command(repository.clone(), token, args).await);
-                (detail, Some(post_command_cleanup(repository).await))
+                (detail, Some(post_command_cleanup(repository)))
             };
 
             check_no_lingering_repository(weak_repository);
@@ -196,7 +212,7 @@ where
                     Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                 };
                 let detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
-                (detail, Some(post_command_cleanup(repository).await))
+                (detail, Some(post_command_cleanup(repository)))
             };
 
             check_no_lingering_repository(weak_repository);
@@ -253,19 +269,7 @@ async fn prepare_repository_call(
     Ok((repository_path, execution))
 }
 
-async fn post_command_cleanup(
-    repository: Arc<RepositoryContext>,
-) -> std::sync::Weak<RepositoryContext> {
-    // Snapshot the state so we don't force a pending connect to resolve
-    // just for teardown. session_stop fires when the last Arc ref drops;
-    // local-only commands never connect and have nothing to release.
-    if let lore_revision::repository::RemoteStatus::Connected(remote) =
-        repository.remote_status().await
-    {
-        let correlation_id = execution_context().globals().correlation_id.to_string();
-        remote.release_session(repository.id, &correlation_id);
-    }
-
+fn post_command_cleanup(repository: Arc<RepositoryContext>) -> std::sync::Weak<RepositoryContext> {
     let sync_data = execution_context().globals().sync_data();
     repository.try_spawn_post_command_flush(sync_data);
 

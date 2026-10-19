@@ -7,7 +7,6 @@ use std::sync::OnceLock;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -38,9 +37,8 @@ use crate::node::NodeFileMetadataBlock;
 use crate::node::NodeID;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
-use crate::repository::DOT_LORE;
-use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
+use crate::repository::is_reserved_node_name;
 use crate::revision;
 use crate::state;
 use crate::state::NodeComparison;
@@ -115,7 +113,7 @@ impl EventError for InfoError {
 
 /// Data for the event reporting information about a single file or directory.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileInfoEventData {
     /// Path of the file or directory.
@@ -272,7 +270,9 @@ async fn info_path(
 
         if filtered {
             // We will be iterating the tree, cache the state fragments
-            let _ = state_current.cache_fragments(repository.clone()).await;
+            let _ = state_current
+                .cache_fragments(repository.clone(), false)
+                .await;
         }
 
         lore_debug!("Info local {local} and filtered {filtered}");
@@ -423,7 +423,13 @@ async fn compare_to_node(
     let local_hash = match comparison {
         NodeComparison::Matches => node.address.hash,
         NodeComparison::Differs => {
-            immutable::hash_file(repository.clone(), &operation.content_source(relative_path))
+            let source = operation
+                .content_source(relative_path)
+                .await
+                .forward_with::<InfoError, _>(|| {
+                    format!("naming the content of local file {relative_path}")
+                })?;
+            immutable::hash_file(repository.clone(), &source)
                 .await
                 .forward_with::<InfoError, _>(|| {
                     format!("Failed to hash local file: {relative_path}")
@@ -566,7 +572,7 @@ async fn calculate_local_filtered_size_hash(
 
 /// Whether `path` names the repository's own directory, which no walk measures or descends into.
 fn is_dot_directory(path: &RelativePath) -> bool {
-    path.as_str() == DOT_URC || path.as_str() == DOT_LORE
+    is_reserved_node_name(path.as_str())
 }
 
 /// What the file at `path` adds to the local size, which is nothing where the repository's own
@@ -769,12 +775,15 @@ fn calculate_filtered_size_recurse(
             }
             let sibling = child_node.sibling();
             lore_spawn!(filtered_size_tasks, async move {
-                let name = state
-                    .node_name_ref(repository.clone(), child)
+                let Some(name) = state
+                    .node_name_ref_or_skip(repository.clone(), child)
                     .await
                     .forward::<InfoError>(
                         "Failed to calculate filtered size, encountered an invalid node",
-                    )?;
+                    )?
+                else {
+                    return Ok(0);
+                };
                 let relative_path = relative_path.push_into_buf(name).freeze();
                 calculate_filtered_size_recurse(
                     repository,
