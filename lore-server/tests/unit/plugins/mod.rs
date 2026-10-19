@@ -4,4 +4,5 @@
 mod aws;
 mod hashicorp;
 mod registry;
+mod s3_postgres;
 mod traits;

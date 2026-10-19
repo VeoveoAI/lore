@@ -4,7 +4,6 @@ pub mod auth;
 pub mod connection;
 pub mod error;
 pub mod grpc;
-pub mod pinned;
 pub mod quic;
 pub mod session;
 pub mod tls;

@@ -16,7 +16,9 @@ mod topology_refresh;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::lore_spawn;
+use lore_base::runtime::DetachingJoinSet;
 use lore_error_set::prelude::*;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_CONTEXT_ATTRIBUTE_NAME;
@@ -26,7 +28,6 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use super::StoreObliterateStats;
@@ -261,6 +262,9 @@ pub struct CompositeStoreBuilder {
     /// The delay applied to durable store operations so replicas are given a chance
     /// to fulfill a request first. `Duration` default is 0 length (no delay)
     durable_delay: Duration,
+    /// Whether a copy is recorded beyond the durable store. `None` enables it — see
+    /// [`Self::with_record_copy_out_of_band`].
+    record_copy_out_of_band: Option<bool>,
 }
 
 impl CompositeStoreBuilder {
@@ -274,6 +278,18 @@ impl CompositeStoreBuilder {
     ) -> Self {
         self.cache_metadata = cache_metadata;
         self.cache_metadata_semaphore_size = semaphore_size;
+        self
+    }
+
+    /// Record a copy the durable store accepted in the local store and at the write replicas, as
+    /// detached work. `None` enables it.
+    ///
+    /// Disabling leaves the durable store as the only holder of the destination association, so
+    /// every later lookup of it costs a round trip there. It is a release valve for a deployment
+    /// where the extra read and write of the content per copy is not worth that, not a correctness
+    /// switch.
+    pub fn with_record_copy_out_of_band(mut self, enabled: Option<bool>) -> Self {
+        self.record_copy_out_of_band = enabled;
         self
     }
 
@@ -391,6 +407,7 @@ impl CompositeStoreBuilder {
             cache_metadata: self.cache_metadata,
             cache_metadata_semaphore,
             local_metadata_only: self.local_metadata_only,
+            record_copy_out_of_band: self.record_copy_out_of_band.unwrap_or(true),
             peers_refreshed_guard: Semaphore::new(1),
             peer_replica_builder: self.peer_replica_builder,
             topology_subscription: None.into(),
@@ -420,6 +437,21 @@ impl CompositeStoreBuilder {
 
 #[error_set]
 pub enum PeersRefreshedError {}
+
+struct CompositeCopyBehavior {
+    copy_behavior: CopyBehavior,
+    /// The destination's content where a put drove the copy, with the fragment that put supplied
+    /// to describe it. The pair is kept together because the representation the durable store
+    /// copied need not be the one these bytes are in.
+    supplied: Option<(Fragment, Bytes)>,
+}
+
+#[derive(Clone, Debug)]
+struct CompositeGetOutput {
+    get_data: StoreGetData,
+    /// The local store answered the read, or a write of the result to it has been spawned.
+    local_cache_will_be_warm: bool,
+}
 
 /// A store that is able to propagate read and write operations to local, durable and replica stores.
 ///
@@ -456,6 +488,9 @@ pub struct CompositeStore {
     cache_metadata_semaphore: Arc<Semaphore>,
     /// If true, local store only caches metadata (no payloads)
     local_metadata_only: bool,
+    /// Whether a copy the durable store accepted is also recorded locally and at the write
+    /// replicas. Off leaves the durable store the only holder of the destination association.
+    record_copy_out_of_band: bool,
 
     peer_replica_builder: Option<Arc<dyn ReplicaFactory>>,
     peers_refreshed_guard: Semaphore,
@@ -463,7 +498,7 @@ pub struct CompositeStore {
 
     instruments: CompositeStoreInstruments,
 
-    inflight_gets: InflightOutput<InflightGetsKey, Result<StoreGetData, StoreError>>,
+    inflight_gets: InflightOutput<InflightGetsKey, Result<CompositeGetOutput, StoreError>>,
     inflight_get_metadatas: InflightOutput<InflightGetsKey, Result<StoreGetData, StoreError>>,
 }
 
@@ -480,13 +515,13 @@ where
     T: 'static,
 {
     cancellation_token: CancellationToken,
-    queries: JoinSet<T>,
+    queries: DetachingJoinSet<T>,
 }
 
 impl<T> CompositeOperation<T> {
     fn new() -> Self {
         Self {
-            queries: JoinSet::new(),
+            queries: DetachingJoinSet::default(),
             cancellation_token: CancellationToken::new(),
         }
     }
@@ -498,10 +533,6 @@ where
 {
     fn drop(&mut self) {
         self.cancellation_token.cancel();
-        // not every target of a composite store operation is cancel
-        // safe, e.g. QUIC futures writing to a connection.
-        // Therefore, it is safest to detach all
-        self.queries.detach_all();
     }
 }
 
@@ -694,33 +725,11 @@ impl CompositeStore {
         }
     }
 
-    /// Detached fan-out of a copy to every write replica, skipped for the reason on
-    /// [`Self::replicate_put`].
-    fn replicate_copy(
-        &self,
-        source_partition: Partition,
-        source_address: Address,
-        partition: Partition,
-        context: Context,
-    ) {
-        let Ok(write_replicas) = self.write_replicas.try_read() else {
-            return;
-        };
-        for replica in write_replicas.iter() {
-            let replica_store = replica.store();
-            lore_spawn!(async move {
-                replica_store
-                    .copy(source_partition, source_address, partition, context, true)
-                    .await
-            });
-        }
-    }
-
     async fn get_from_remotes(
         self: Arc<Self>,
         partition: Partition,
         address: Address,
-    ) -> Result<StoreGetData, StoreError> {
+    ) -> Result<CompositeGetOutput, StoreError> {
         let mut fan_out = CompositeOperation::new();
         let queries = &mut fan_out.queries;
 
@@ -765,6 +774,7 @@ impl CompositeStore {
                     // If the durable store was the first to answer, then either the
                     // replicas are too slow or don't have the fragment, so we should build up
                     // our own local cache
+                    let mut local_cache_will_be_warm = false;
                     if !self.local_durable && matches!(result, CompositeStoreHit::Durable(_)) {
                         // Cache the found result locally
                         let local_store = self.local.store();
@@ -775,6 +785,7 @@ impl CompositeStore {
                             result.inner().payload.clone()
                         };
                         let cache_counter = self.instruments.counter_local_caching.clone();
+                        local_cache_will_be_warm = true;
                         lore_spawn!(async move {
                             fragment.flags |= FragmentFlags::PayloadStoredLocal
                                 | FragmentFlags::PayloadStoredDurable;
@@ -785,7 +796,11 @@ impl CompositeStore {
                             put_result
                         });
                     }
-                    return result.into_counted_result(&self.instruments.counter_get);
+                    return Ok(CompositeGetOutput {
+                        get_data: result
+                            .into_counted_result::<StoreError>(&self.instruments.counter_get)?,
+                        local_cache_will_be_warm,
+                    });
                 }
                 Err(StoreError::SlowDown(_)) => {
                     error_to_return = StoreError::from(SlowDown);
@@ -897,6 +912,154 @@ impl CompositeStore {
         }
 
         best_result.into_counted_result(&self.instruments.counter_get_metadata)
+    }
+
+    async fn copy_implementation(
+        self: Arc<Self>,
+        source_partition: Partition,
+        source_address: Address,
+        destination_partition: Partition,
+        destination_context: Context,
+        composite_behavior: CompositeCopyBehavior,
+    ) -> Result<(), StoreError> {
+        self.durable
+            .store()
+            .copy(
+                source_partition,
+                source_address,
+                destination_partition,
+                destination_context,
+                composite_behavior.copy_behavior,
+            )
+            .await?;
+
+        if !self.local_durable && self.record_copy_out_of_band {
+            let store = self.clone();
+            let cache_counter = self.instruments.counter_local_caching.clone();
+            let destination_address = Address {
+                hash: source_address.hash,
+                context: destination_context,
+            };
+            // It is worthwhile caching this new copy so we know of its existence in the
+            // other partition, in case we are ever asked for it.
+            lore_spawn!(async move {
+                let (mut destination_fragment, destination_payload, record_locally) =
+                    if let Some((fragment, payload)) = composite_behavior.supplied {
+                        // A put already found the local store short of a full match, and the
+                        // durable store has just accepted the copy, so a read adds nothing. The
+                        // put's own fragment is the one describing its bytes; the durable copy's
+                        // representation can differ (e.g. compressed there, uncompressed here).
+                        (fragment, Some(payload), true)
+                    } else {
+                        // Our local store might not have the source content to copy into the
+                        // destination, so we may have to go through the durable store; hence
+                        // just do `get` on the composite store itself.
+                        // If our local store does have it locally, then `get` will resolve faster
+                        let get_result = store
+                            .clone()
+                            .get_implementation(destination_partition, destination_address)
+                            .await;
+                        count_result("get_after_copy", &cache_counter, &get_result);
+
+                        // the durable store already accepted the copy, so just sanity check
+                        // we got it as well
+                        let Ok(copied) = get_result else {
+                            return;
+                        };
+                        if matches!(copied.get_data.match_made, StoreMatch::MatchNone) {
+                            return;
+                        }
+                        let record_locally =
+                            !matches!(copied.get_data.match_made, StoreMatch::MatchFull)
+                                || !copied.local_cache_will_be_warm;
+                        (
+                            copied.get_data.fragment,
+                            copied.get_data.payload,
+                            record_locally,
+                        )
+                    };
+
+                // the durable store did the copy, so this new destination fragment
+                // is durably stored
+                if composite_behavior.copy_behavior.durable {
+                    destination_fragment.flags |= FragmentFlags::PayloadStoredDurable;
+                }
+
+                // The durable store confirmed the copy succeeded, so update our local record.
+                // Our local record might not even have the source destination+address so `put`
+                // the destination instead of attempting to `copy` the source
+                let local_payload = if store.local_metadata_only {
+                    None // Strip payload — local store only caches metadata
+                } else {
+                    destination_payload.clone()
+                };
+                if record_locally {
+                    let local_copy_result = self
+                        .local
+                        .store()
+                        .put(
+                            destination_partition,
+                            destination_address,
+                            destination_fragment,
+                            local_payload,
+                            false, /* do not force */
+                        )
+                        .await;
+                    count_result("local_put_after_copy", &cache_counter, &local_copy_result);
+                }
+
+                // fan out to write replicas so they hold the copy under the new partition and
+                // can serve it if it is ever asked for
+                if !composite_behavior.copy_behavior.do_not_replicate {
+                    store.replicate_put(
+                        destination_partition,
+                        destination_address,
+                        destination_fragment,
+                        destination_payload,
+                        false, /* do not force */
+                    );
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn get_implementation(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<CompositeGetOutput, StoreError> {
+        if let Ok(result) = self
+            .local
+            .store()
+            .get(partition, address)
+            .await
+            .map(CompositeStoreHit::Local)
+        {
+            return Ok(CompositeGetOutput {
+                get_data: result
+                    .into_counted_result::<StoreError>(&self.instruments.counter_get)?,
+                local_cache_will_be_warm: true,
+            });
+        }
+
+        match self.inflight_gets.request((partition, address)) {
+            RequestRole::RequestMaker(guard) => {
+                let result = self.clone().get_from_remotes(partition, address).await;
+                guard.broadcast(&result);
+                result
+            }
+            RequestRole::ResultAwaiter(mut receiver) => {
+                self.instruments.counter_get_inflight_receiver.add(1, &[]);
+                receiver.recv().await.unwrap_or_else(|receive_error| {
+                    Err(StoreError::internal_with_context(
+                        receive_error,
+                        "Failed to get inflight result",
+                    ))
+                })
+            }
+        }
     }
 }
 
@@ -1129,39 +1292,15 @@ impl ImmutableStore for CompositeStore {
         partition: Partition,
         address: Address,
     ) -> Result<StoreGetData, StoreError> {
-        if let Ok(result) = self
-            .local
-            .store()
-            .get(partition, address)
-            .await
-            .map(CompositeStoreHit::Local)
-        {
-            return result.into_counted_result(&self.instruments.counter_get);
-        }
-
-        match self.inflight_gets.request((partition, address)) {
-            RequestRole::RequestMaker(guard) => {
-                let result = self.clone().get_from_remotes(partition, address).await;
-                guard.broadcast(&result);
-                result
-            }
-            RequestRole::ResultAwaiter(mut receiver) => {
-                self.instruments.counter_get_inflight_receiver.add(1, &[]);
-                receiver.recv().await.unwrap_or_else(|receive_error| {
-                    Err(StoreError::internal_with_context(
-                        receive_error,
-                        "Failed to get inflight result",
-                    ))
-                })
-            }
-        }
+        Ok(self.get_implementation(partition, address).await?.get_data)
     }
 
     /// A full match is written nowhere. A weaker one the durable store holds is written by
-    /// duplicating that association — see [`can_put_use_copy`] — and the payload is released before
-    /// the round trip, so a refused copy has nothing to fall back on and fails the put. Recovery is
-    /// the caller's: it still holds the payload and retries. Replicas are issued the same copy, and
-    /// one that cannot answer it simply does not hold the association.
+    /// duplicating that association — see [`can_put_use_copy`] — carrying the fragment and payload
+    /// so the destination can be recorded without reading the content back. A refused copy is not fallen
+    /// back on and fails the put. Recovery is the caller's: it still holds the payload and
+    /// retries. The local store and the replicas are sent the destination's content once the
+    /// association exists.
     async fn put(
         self: Arc<Self>,
         partition: Partition,
@@ -1170,14 +1309,14 @@ impl ImmutableStore for CompositeStore {
         payload: Option<Bytes>,
         force: bool,
     ) -> Result<(), StoreError> {
-        let resolved = if force {
+        let local_resolve = if force {
             StoreMatchResult::default()
         } else {
             query_one(&self.local.store(), partition, address)
                 .await
                 .unwrap_or_default()
         };
-        if resolved.match_made == StoreMatch::MatchFull {
+        if local_resolve.match_made == StoreMatch::MatchFull {
             return CompositeStoreHit::Local(()).into_counted_result(&self.instruments.counter_put);
         }
 
@@ -1189,24 +1328,25 @@ impl ImmutableStore for CompositeStore {
         };
         let behaviour = sanitise_fragment_behavior_flags(&mut fragment);
 
-        if payload.is_some()
+        if let Some(supplied_payload) = &payload
             && let Some((source_partition, source_address)) =
-                can_put_use_copy(&resolved, address.hash)
+                can_put_use_copy(&local_resolve, address.hash)
         {
-            drop(payload);
-
             self.clone()
-                .copy(
+                .copy_implementation(
                     source_partition,
                     source_address,
                     partition,
                     address.context,
-                    true,
+                    CompositeCopyBehavior {
+                        copy_behavior: CopyBehavior {
+                            durable: true,
+                            do_not_replicate: behaviour.do_not_replicate,
+                        },
+                        supplied: Some((fragment, supplied_payload.clone())),
+                    },
                 )
                 .await?;
-            if !behaviour.do_not_replicate {
-                self.replicate_copy(source_partition, source_address, partition, address.context);
-            }
 
             return CompositeStoreHit::Durable(())
                 .into_counted_result(&self.instruments.counter_put);
@@ -1315,6 +1455,10 @@ impl ImmutableStore for CompositeStore {
         self.local.store().compact_resume_at().await
     }
 
+    async fn load_index(self: Arc<Self>) -> Result<(), StoreError> {
+        self.local.store().load_index().await
+    }
+
     async fn stop_gc(self: Arc<Self>, terminate: bool) {
         // Collected before awaiting so no replica lock is held across the drain, then driven
         // together so every target is asked to stop on the first poll rather than each
@@ -1368,39 +1512,19 @@ impl ImmutableStore for CompositeStore {
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        durable: bool,
+        behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
-        self.durable
-            .store()
-            .copy(
-                source_partition,
-                source_address,
-                destination_partition,
-                destination_context,
-                durable,
-            )
-            .await?;
-
-        if !self.local_durable {
-            // The local mirror reflects whatever durability the durable side just confirmed.
-            let local = self.local.store();
-            let cache_counter = self.instruments.counter_local_caching.clone();
-            lore_spawn!(async move {
-                let copy_result = local
-                    .copy(
-                        source_partition,
-                        source_address,
-                        destination_partition,
-                        destination_context,
-                        durable,
-                    )
-                    .await;
-                count_result("copy", &cache_counter, &copy_result);
-                copy_result
-            });
-        }
-
-        Ok(())
+        self.copy_implementation(
+            source_partition,
+            source_address,
+            destination_partition,
+            destination_context,
+            CompositeCopyBehavior {
+                copy_behavior: behavior,
+                supplied: None,
+            },
+        )
+        .await
     }
 }
 

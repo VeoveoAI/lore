@@ -31,6 +31,7 @@ use lore_storage::StoreGetData;
 use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_transport::ProtocolError;
 use lore_transport::quic::client::ConnectionStats;
 use parking_lot::Mutex;
@@ -960,6 +961,7 @@ mod get {
                                 match_made: lore_storage::StoreMatch::MatchFull,
                                 partition,
                                 payload: Some(payload.clone()),
+                                content: None,
                             })
                         });
                 }
@@ -1064,6 +1066,7 @@ mod copy {
                         source_address,
                         destination_context,
                         durable: false,
+                        do_not_replicate: true,
                     }))
                     .returning(|_| Ok(()));
 
@@ -1083,7 +1086,10 @@ mod copy {
                         source_address,
                         destination_partition,
                         destination_context,
-                        false,
+                        CopyBehavior {
+                            durable: false,
+                            do_not_replicate: false,
+                        },
                     )
                     .await
                     .expect("copy should succeed");
@@ -1131,7 +1137,10 @@ mod copy {
                         source_address,
                         destination_partition,
                         destination_context,
-                        true,
+                        CopyBehavior {
+                            durable: true,
+                            do_not_replicate: false,
+                        },
                     )
                     .await
                     .expect("copy should succeed");
@@ -1176,7 +1185,10 @@ mod copy {
                         source_address,
                         destination_partition,
                         destination_context,
-                        false,
+                        CopyBehavior {
+                            durable: false,
+                            do_not_replicate: false,
+                        },
                     )
                     .await
                     .expect_err("copy should fail on service error");
@@ -1226,6 +1238,7 @@ mod get_metadata {
                             match_made: lore_storage::StoreMatch::MatchFull,
                             partition,
                             payload: None,
+                            content: None,
                         })
                     });
 
@@ -1282,6 +1295,7 @@ mod get_metadata {
                             match_made: lore_storage::StoreMatch::MatchPartition,
                             partition,
                             payload: None,
+                            content: None,
                         })
                     });
 

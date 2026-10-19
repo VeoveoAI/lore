@@ -32,6 +32,7 @@ use lore_storage::StoreError;
 use lore_storage::StoreGetData;
 use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_telemetry::LabelArray;
 use lore_transport::ProtocolError;
 use lore_transport::quic::client::ConnectionStats;
@@ -212,7 +213,10 @@ async fn copy_returns_error() {
                     address,
                     partition,
                     lore_base::types::Context::default(),
-                    false,
+                    CopyBehavior {
+                        durable: false,
+                        do_not_replicate: false,
+                    },
                 )
                 .await
                 .expect_err("copy should not be supported on read replica");
@@ -880,6 +884,7 @@ mod get {
                                 match_made: lore_storage::StoreMatch::MatchFull,
                                 partition: repository.into(),
                                 payload: Some(payload.clone()),
+                                content: None,
                             })
                         });
                 }
@@ -1025,6 +1030,7 @@ mod get_metadata {
                             match_made: lore_storage::StoreMatch::MatchFull,
                             partition: repository.into(),
                             payload: None,
+                            content: None,
                         })
                     });
 
@@ -1081,6 +1087,7 @@ mod get_metadata {
                             match_made: lore_storage::StoreMatch::MatchPartition,
                             partition: repository.into(),
                             payload: None,
+                            content: None,
                         })
                     });
 

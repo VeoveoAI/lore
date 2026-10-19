@@ -34,17 +34,6 @@ pub fn client_main() -> ExitCode {
         )
     };
 
-    #[cfg(target_os = "linux")]
-    let sandboxed = match crate::sandbox::load() {
-        Ok(sandboxed) => sandboxed,
-        Err(err) => {
-            crate::eprintln!("Error: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    #[cfg(not(target_os = "linux"))]
-    let sandboxed = false;
-
     let time_start = Instant::now();
 
     let cli = LoreCli::parse();
@@ -58,19 +47,6 @@ pub fn client_main() -> ExitCode {
         let _ = cmd.print_help();
         return ExitCode::from(2);
     };
-
-    if sandboxed {
-        if cli.identity_token.is_some() || cli.access_token.is_some() {
-            crate::eprintln!(
-                "Error: this installation supplies Lore credentials; --identity-token and --access-token are refused"
-            );
-            return ExitCode::FAILURE;
-        }
-        if matches!(cli_command, LoreCommands::Service(_)) {
-            crate::eprintln!("Error: this installation runs Lore without a service");
-            return ExitCode::FAILURE;
-        }
-    }
 
     let log_config = match logging::log_config_from_args(&cli) {
         Ok(config) => config,
@@ -102,7 +78,13 @@ pub fn client_main() -> ExitCode {
         lore::size_threads_for_relaying();
     }
 
-    let mut globals = lore_globals_from_args(&cli);
+    let mut globals = match lore_globals_from_args(&cli) {
+        Ok(globals) => globals,
+        Err(err) => {
+            crate::eprintln!("Error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     if let Err(err) = globals.validate() {
         crate::eprintln!("Error: {err}");
         return ExitCode::FAILURE;

@@ -4,6 +4,47 @@ use std::str::FromStr;
 
 use lore_revision::util::path::*;
 
+/// What `f` returns and the allocations the calling thread made running it.
+///
+/// Counting stays on, since switching it off would undercount a test measuring on another thread.
+fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    lore_base::allocator::set_allocation_counting(true);
+    let before = lore_base::allocator::thread_allocation_count();
+    let value = std::hint::black_box(f());
+    (
+        value,
+        lore_base::allocator::thread_allocation_count() - before,
+    )
+}
+
+/// A path built from a string makes its two strings and the shared data once each, never
+/// growing either string, however many names it holds.
+#[test]
+fn a_path_from_an_initial_string_allocates_its_two_strings_and_its_data_once() {
+    let (path, allocated) = allocations_during(|| {
+        RelativePath::new_from_initial_path("Content/Maps/Level01/Props.umap").expect("path")
+    });
+    assert_eq!(path.as_str(), "Content/Maps/Level01/Props.umap");
+    assert_eq!(path.as_lowercase_str(), "content/maps/level01/props.umap");
+    assert_eq!(
+        allocated, 3,
+        "allocations other than the two strings and the shared data"
+    );
+}
+
+/// A push reserves only the bytes it appends, so a path sized for a name grows neither string
+/// when the name is pushed into it.
+#[test]
+fn a_push_into_a_path_sized_for_it_grows_neither_string() {
+    let mut path = RelativePathBuf::with_capacity("Content/Maps".len());
+    let (_, allocated) = allocations_during(|| {
+        path.push("Content/Maps");
+    });
+    assert_eq!(path.as_str(), "Content/Maps");
+    assert_eq!(path.as_lowercase_str(), "content/maps");
+    assert_eq!(allocated, 0);
+}
+
 #[test]
 fn a_path_below_an_ancestor_is_the_names_between_them() {
     let path = RelativePath::new_from_clean_parts("thr/sub/file.txt", "");
@@ -305,6 +346,17 @@ mod is_path_inside_repository {
         // new_from_user_path lowercases both sides before comparing.
         assert!(is_path_inside_repository(Path::new("/A/B"), "/a/b/x.txt",));
     }
+
+    /// The dot directory is inside the root for this question, however spelled, even though the
+    /// tree holds it nowhere: the write dispatch it picks is the safe default.
+    #[test]
+    fn the_dot_directory_is_inside() {
+        assert!(is_path_inside_repository(
+            Path::new("/a/b"),
+            "/a/b/.lore/config.toml"
+        ));
+        assert!(is_path_inside_repository(Path::new("/a/b"), "/a/b/.URC"));
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -344,12 +396,14 @@ mod repository_relative_path {
         assert_eq!(held("/a/b/.URC/config"), None);
     }
 
-    /// Only the dot directory itself is the repository's own state: a name that merely begins
-    /// with it, or one of that name further down, is content the tree tracks.
+    /// A name that merely begins with the dot directory is ordinary content. A dot directory
+    /// further down is a nested repository's own, which this tree holds nowhere either: no node
+    /// carries the name at any depth.
     #[test]
-    fn a_name_that_is_not_the_dot_directory_is_held() {
+    fn a_name_that_merely_begins_with_the_dot_directory_is_held() {
         assert_eq!(held("/a/b/.lorebak/x").as_deref(), Some(".lorebak/x"));
-        assert_eq!(held("/a/b/sub/.lore/x").as_deref(), Some("sub/.lore/x"));
+        assert_eq!(held("/a/b/sub/.lore/x"), None);
+        assert_eq!(held("/a/b/sub/.URC"), None);
     }
 }
 
@@ -373,4 +427,48 @@ fn a_parent_path_narrows_both_views() {
     let grandparent = nested.parent_path().parent_path();
     assert_eq!(grandparent.as_str(), "A");
     assert_eq!(grandparent.as_lowercase_str(), "a");
+}
+
+#[cfg(not(target_os = "windows"))]
+mod a_user_path_through_the_dot_directory {
+    use std::path::Path;
+
+    use lore_revision::util::path::RelativePath;
+
+    /// No node carries the name at any depth or in any ASCII case, so a user path through it is
+    /// an invalid path, the answer every verb already gives a path outside the root.
+    #[test]
+    fn is_refused_in_any_case_and_at_any_depth() {
+        for candidate in [
+            "/a/b/.lore",
+            "/a/b/.LORE/id",
+            "/a/b/.urc/config.toml",
+            "/a/b/sub/.Urc/x",
+        ] {
+            assert!(
+                RelativePath::new_from_user_path(Path::new("/a/b"), candidate).is_err(),
+                "{candidate} must be refused"
+            );
+        }
+    }
+
+    /// A mount hands paths in by geometry and leaves the question to the resolver, so the
+    /// conversion it uses holds the path and refuses only what lies outside the root.
+    #[test]
+    fn a_mount_path_through_it_is_held_by_geometry() {
+        let held = RelativePath::new_from_mount_path(Path::new("/a/b"), "/a/b/.lore/id")
+            .expect("a mount path under the root is held");
+        assert_eq!(held.as_str(), ".lore/id");
+        assert!(RelativePath::new_from_mount_path(Path::new("/a/b"), "/a/c/x").is_err());
+    }
+
+    #[test]
+    fn a_name_that_merely_begins_with_it_is_accepted() {
+        for candidate in ["/a/b/.loreignore", "/a/b/.urcignore", "/a/b/.lorebak/x"] {
+            assert!(
+                RelativePath::new_from_user_path(Path::new("/a/b"), candidate).is_ok(),
+                "{candidate} must be accepted"
+            );
+        }
+    }
 }

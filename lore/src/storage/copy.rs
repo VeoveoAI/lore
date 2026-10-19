@@ -17,12 +17,12 @@
 //!    connection.
 //! 3. **Fail** — no local payload, source genuinely gone → `ADDRESS_NOT_FOUND`.
 //!
-//! When tiers 1 or 2 succeed, the local entry is mirrored via `ImmutableStore::copy(.., durable=true)`
+//! When tiers 1 or 2 succeed, the local entry is mirrored via a `CopyBehavior` naming it durable
 //! on a best-effort basis: any local-mirror failure is benign (the destination tuple is durable on
 //! the peer; clients fetch on demand). Per-item failures are not surfaced to the caller; the
 //! call-level closure tallies them and emits a single debug log when the batch finishes.
 //!
-//! Local-only handles take a single `ImmutableStore::copy(.., durable=false)` step: source's
+//! Local-only handles take a single `ImmutableStore::copy` step that does not claim durability: source's
 //! payload pointer and content-describing flags are adopted (encoding follows the bytes it
 //! describes, otherwise reads decode against the wrong codec); source's `PayloadStoredDurable`
 //! is masked off and the target's pre-existing flag (if any) is preserved.
@@ -48,11 +48,10 @@ use lore_revision::interface::LoreArray;
 use lore_revision::lore_debug;
 use lore_revision::store::event::LoreStorageCopyItemCompleteEventData;
 use lore_storage::StorageError;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::options::ReadOptions;
 use lore_storage::read::load_fragment;
 use lore_transport::ProtocolError;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
@@ -67,7 +66,9 @@ use crate::storage::store::StoreInternal;
 /// One copy item — relocate content from `(source_partition, source_address)` to
 /// `(target_partition, source_address.hash, target_context)`, preserving the content hash.
 #[repr(C)]
-#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(
+    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+)]
 pub struct LoreStorageCopyItem {
     /// Caller-chosen id echoed back in `COPY_ITEM_COMPLETE`
     pub id: u64,
@@ -85,7 +86,7 @@ pub struct LoreStorageCopyItem {
 
 /// Arguments for `lore_storage_copy`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(copy_local)]
 pub struct LoreStorageCopyArgs {
     /// Open storage handle
@@ -240,7 +241,10 @@ async fn copy_item(
                 item.source_address,
                 item.target_partition,
                 item.target_context,
-                false,
+                CopyBehavior {
+                    durable: false,
+                    do_not_replicate: false,
+                },
             )
             .await
         {
@@ -339,7 +343,10 @@ async fn mirror_local_durable(
             item.source_address,
             item.target_partition,
             item.target_context,
-            true,
+            CopyBehavior {
+                durable: true,
+                do_not_replicate: false,
+            },
         )
         .await
         .is_err();

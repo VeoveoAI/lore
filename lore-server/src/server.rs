@@ -664,6 +664,7 @@ fn build_lore_http_settings(
     user_agent_filter: Arc<UserAgentFilter>,
 ) -> LoreHttpServerSettings {
     LoreHttpServerSettings {
+        health_only: http_settings.health_only,
         port: http_settings.port,
         host: http_settings.host.clone(),
         max_file_size: http_settings.max_file_size,
@@ -889,6 +890,19 @@ impl StreamHandlerFactory for QuicInternalStreamHandler {
     fn name(&self) -> &'static str {
         "QuicInternalStreamHandler"
     }
+}
+
+/// Open the selected native stores for operator tooling while the owning server is stopped.
+/// This does not start a listener or change authentication/authorization configuration.
+pub async fn open_operator_stores(
+    settings: &Settings,
+) -> Result<(Arc<dyn ImmutableStore>, Arc<dyn MutableStore>)> {
+    let mut registry = PluginRegistry::new();
+    plugins::register_all_plugins(&mut registry);
+    let immutable = configure_immutable_store_via_plugin(&registry, settings, None).await?;
+    let mutable =
+        configure_mutable_store_via_plugin(&registry, settings, immutable.clone()).await?;
+    Ok((immutable, mutable))
 }
 
 async fn configure_immutable_store_via_plugin(
@@ -1485,10 +1499,12 @@ async fn configure_composite_store(
 ) -> Result<Arc<dyn ImmutableStore>> {
     info!("Wiring up Composite store");
 
-    let mut composite_store_builder = CompositeStoreBuilder::default().with_cache_metadata(
-        settings.cache_metadata.unwrap_or_default(),
-        settings.cache_metadata_semaphore_size,
-    );
+    let mut composite_store_builder = CompositeStoreBuilder::default()
+        .with_cache_metadata(
+            settings.cache_metadata.unwrap_or_default(),
+            settings.cache_metadata_semaphore_size,
+        )
+        .with_record_copy_out_of_band(settings.record_copy_out_of_band);
 
     let store = Box::pin(configure_composite_substore(
         registry,
@@ -2063,7 +2079,6 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 jwt_issuer: Some(auth.jwt_issuer.clone()),
                 jwt_audience: Some(auth.jwt_audience.clone()),
                 jwt_typ: auth.jwt_typ.clone(),
-                identity_claim: auth.identity_claim.clone(),
             })
         }
         None => None,

@@ -38,7 +38,22 @@
 //
 // The library copies argument data before it starts the call. The caller may
 // free or reuse the argument memory once the call returns. This holds for
-// synchronous and asynchronous calls.
+// synchronous and asynchronous calls, except for the memory a lore_bytes_mut_t
+// names, which the library writes while the call runs: see lore_bytes_mut_t.
+//
+// Call lore_shutdown only once every call has completed: a synchronous call has
+// returned, and an asynchronous one has delivered END. The library makes a best
+// effort to cancel calls still executing safely, but a call it does not stop in
+// time may still use the library and the memory passed to it after
+// lore_shutdown returns.
+//
+// Structures
+//
+// Zero every byte of a structure before passing it to the library, padding
+// included, as memset does, then set the fields the call uses. A field left
+// zero selects the default its documentation names. A release can add a field
+// in a structure's padding, which code built against an earlier header leaves
+// unset: such code keeps its behavior only where it zeroed every byte.
 //
 // See lore_event_callback_config_t for how callbacks work.
 
@@ -51,7 +66,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define LORE_INTERFACE_VERSION "0.10.1-nightly"
+#define LORE_INTERFACE_VERSION "0.10.2-nightly"
 
 // The kind of value held by a metadata entry.
 //
@@ -160,12 +175,6 @@ typedef enum lore_revision_resolve_target_t {
 // thing as the code on `Complete.status`. This enum names the subset a
 // per-item event can carry; it is not a second numbering.
 //
-// The variant order is the serialized wire format, not the numbering. Serde
-// encodes a variant by its declaration index in a non-self-describing format,
-// and `LoreEvent` crosses the service boundary in one, so reordering these
-// would silently redecode old payloads as different errors. Add new variants
-// at the end and change discriminants in place.
-//
 typedef enum lore_error_code_t {
   // No error; the operation succeeded.
   LORE_ERROR_CODE_NONE = 0,
@@ -178,6 +187,19 @@ typedef enum lore_error_code_t {
   // The backing store is overloaded; the caller should retry later.
   LORE_ERROR_CODE_SLOW_DOWN = 31,
 } lore_error_code_t;
+
+// Which authentication path a client takes if a server advertises both its
+// gRPC auth service and an OIDC issuer. A path the server does not
+// advertise cannot be taken.
+typedef enum lore_auth_mode_t {
+  // Follow the server's preference: the OIDC path if the server marks it
+  // preferred, the gRPC path otherwise.
+  LORE_AUTH_MODE_AUTO = 0,
+  // The gRPC path, through the auth service at `auth_url`.
+  LORE_AUTH_MODE_GRPC = 1,
+  // The OIDC path, through the advertised OIDC issuer.
+  LORE_AUTH_MODE_OIDC = 2,
+} lore_auth_mode_t;
 
 // Virtual File System type for repository operations.
 //
@@ -361,9 +383,7 @@ typedef struct lore_complete_event_data_t {
   // The completion status code of the operation.
   int32_t status;
   // The error detail for the operation. The empty default detail on
-  // success; the populated detail on failure. `#[serde(default)]` lets an
-  // older payload that lacks this field deserialize: the detail then reads
-  // back as the empty default with an empty trace list.
+  // success; the populated detail on failure.
   struct lore_error_detail_t error;
 } lore_complete_event_data_t;
 
@@ -464,6 +484,9 @@ typedef struct lore_maintenance_event_data_t {
 typedef struct lore_auth_url_event_data_t {
   // Authentication URL
   struct lore_string_t url;
+  // Code the user enters or confirms at `url`. Empty when the login
+  // doesn't ask for one.
+  struct lore_string_t user_code;
 } lore_auth_url_event_data_t;
 
 // Event data resolving a user identity to a display name.
@@ -1845,7 +1868,8 @@ typedef struct lore_repository_clone_progress_event_data_t {
   struct lore_repository_clone_count_data_t count;
 } lore_repository_clone_progress_event_data_t;
 
-// Data for the event emitted when a clone finishes.
+// Data for the event emitted when a clone succeeds. A clone that fails sends no such event, and
+// reports its outcome on the complete event as every clone does.
 typedef struct lore_repository_clone_end_event_data_t {
   // Name of the branch that was cloned.
   struct lore_string_t branch;
@@ -2616,9 +2640,7 @@ typedef struct lore_storage_put_item_complete_event_data_t {
   struct lore_address_t address;
   // The outcome for the item.
   struct lore_error_detail_t error;
-  // Non-zero when the local store holds the content. Trailing, so a payload that lacks it still
-  // decodes: the IPC wire format is non-self-describing, where only a missing trailing field is
-  // recoverable.
+  // Non-zero when the local store holds the content.
   uint8_t stored_local;
   // Non-zero when the content reached the remote, or was already durable there. A remote
   // write that fails still reports success if the local write succeeded — this is how a
@@ -3266,6 +3288,58 @@ typedef struct lore_branch_push_stats_event_data_t {
   uint64_t put;
 } lore_branch_push_stats_event_data_t;
 
+// Data for the service status event, reporting whether the service is running
+// and its current metadata.
+typedef struct lore_service_status_event_data_t {
+  // Whether the service is running: 1 for running, 0 for not running.
+  uint8_t running;
+  // Path to the service binary.
+  struct lore_string_t binary_path;
+  // Milliseconds since the service started.
+  uint64_t uptime_ms;
+  // Number of active client connections.
+  uint32_t connection_count;
+  // Number of SWFS mounts currently active.
+  uint32_t swfs_mount_count;
+} lore_service_status_event_data_t;
+
+// Data for a service log message captured outside command execution.
+typedef struct lore_service_message_event_data_t {
+  // The severity level of the log message.
+  enum lore_log_level_t level;
+  // The log message text.
+  struct lore_string_t message;
+} lore_service_message_event_data_t;
+
+// Event data for one wait in an interactive login: the user has not
+// approved it yet, and the client is about to wait `interval_secs` before
+// asking again. Emitted once per poll, so a consumer can show that the
+// login is still in progress against a provider with a long interval.
+typedef struct lore_auth_pending_event_data_t {
+  // Whole seconds since polling began.
+  uint64_t elapsed_secs;
+  // Whole seconds until the next poll.
+  uint64_t interval_secs;
+  // Whole seconds left before the session expires unapproved.
+  uint64_t remaining_secs;
+} lore_auth_pending_event_data_t;
+
+// Per-leaf event for `get_resolved` with `fragments` set: one leaf fragment of the
+// item's content and its payload. The `bytes` view is valid only during the callback invocation.
+typedef struct lore_storage_get_fragment_event_data_t {
+  // Correlation id of the item.
+  uint64_t id;
+  // The content address of the item.
+  struct lore_address_t address;
+  // The byte offset of this leaf within the item's content.
+  uint64_t offset;
+  // The leaf's fragment, describing `bytes`: the compression among its flags, the payload size
+  // and the content size the payload expands to.
+  struct lore_fragment_t fragment;
+  // The leaf's payload, compressed as `fragment` states.
+  struct lore_bytes_t bytes;
+} lore_storage_get_fragment_event_data_t;
+
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
 enum lore_event_id_t {
@@ -3542,7 +3616,8 @@ enum lore_event_id_t {
   LORE_EVENT_REPOSITORY_CLONE_BEGIN,
   // Progress during a repository clone.
   LORE_EVENT_REPOSITORY_CLONE_PROGRESS,
-  // The end of a repository clone.
+  // The end of a repository clone that succeeded. A clone that fails sends none, and reports its
+  // outcome on the complete event as every clone does.
   LORE_EVENT_REPOSITORY_CLONE_END,
   // The start of resolving dependencies.
   LORE_EVENT_DEPENDENCY_RESOLVE_BEGIN,
@@ -3736,6 +3811,14 @@ enum lore_event_id_t {
   LORE_EVENT_REVISION_COMMIT_STATS,
   // What a push has cost so far, or in total once it has finished.
   LORE_EVENT_BRANCH_PUSH_STATS,
+  // The status of the background service.
+  LORE_EVENT_SERVICE_STATUS,
+  // A log message captured by the service outside command execution.
+  LORE_EVENT_SERVICE_MESSAGE,
+  // An interactive login is still waiting for the user's approval.
+  LORE_EVENT_AUTH_PENDING,
+  // One leaf fragment and its payload for a get-resolved item.
+  LORE_EVENT_STORAGE_GET_FRAGMENT,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -3975,10 +4058,19 @@ typedef struct lore_event_t {
     struct lore_revision_tree_metadata_clear_complete_event_data_t revision_tree_metadata_clear_complete;
     struct lore_revision_commit_stats_event_data_t revision_commit_stats;
     struct lore_branch_push_stats_event_data_t branch_push_stats;
+    struct lore_service_status_event_data_t service_status;
+    struct lore_service_message_event_data_t service_message;
+    struct lore_auth_pending_event_data_t auth_pending;
+    struct lore_storage_get_fragment_event_data_t storage_get_fragment;
   };
 } lore_event_t;
 
 // Common options shared by repository operations.
+//
+// Zero every byte of it, padding included, before setting the fields a call
+// uses, as every structure passed to the library: a field left zero selects
+// its default, and a field a release adds in its padding is left unset by
+// code built against an earlier header.
 typedef struct lore_global_args_t {
   // Repository path
   struct lore_string_t repository_path;
@@ -4002,7 +4094,8 @@ typedef struct lore_global_args_t {
   uint8_t remote;
   // Dry run mode, only report what would have been changed and perform no changes to local file system
   uint8_t dry_run;
-  // Maximum number of parallel connections for bulk data transfer
+  // Number of parallel storage connections for bulk data transfer, 0 for the default of 1.
+  // At most 10 are opened
   uint32_t max_connections;
   // Search limit when iterating revisions
   uint32_t search_limit;
@@ -4058,6 +4151,16 @@ typedef struct lore_global_args_t {
   // whatever `stats` is set to, statistics being reported once at the end
   // rather than on an interval. Zero takes [`DEFAULT_EVENT_INTERVAL_MS`].
   uint64_t event_interval_ms;
+  // Which authentication path to take if the server advertises both its
+  // gRPC auth service and an OIDC issuer.
+  enum lore_auth_mode_t auth_mode;
+  // Treat the remote as a trusted source, for a caller within its
+  // infrastructure where performance comes first: payloads fetched from it
+  // have only their sizes checked against their length, are never hashed,
+  // and are decompressed only where their content is read. A storage handle
+  // takes it from the globals it is opened with. Any non-zero value trusts
+  // the remote, so a caller zeroes the whole struct, padding included
+  uint8_t trust_remote;
 } lore_global_args_t;
 
 // Arguments for resolving user IDs to display names via the remote user service.
@@ -4279,6 +4382,10 @@ typedef struct lore_branch_merge_start_args_t {
   // revision. Empty carries nothing; the single entry `*` carries every
   // key that is not reserved to the merge itself.
   struct lore_string_array_t inherit_metadata;
+  // Array of link relative paths that have specific auto commit messages
+  struct lore_string_array_t link_paths;
+  // Array of messages corresponding to each link path (parallel array with `link_paths`)
+  struct lore_string_array_t link_messages;
 } lore_branch_merge_start_args_t;
 
 // Arguments for switching the working directory to a different branch or revision.
@@ -5100,14 +5207,9 @@ typedef struct lore_storage_open_args_t {
   struct lore_storage_remote_config_t remote_config;
   // Activate `remote_config`; otherwise the handle has no remote
   uint8_t has_remote_config;
-  // Skip re-hashing a loaded payload and checking it against the address it was read from.
-  //
-  // Zero keeps the check, which is the default: a store handing back bytes under a content
-  // address should be able to say they are the bytes that address names. A caller whose own
-  // layer already assures integrity - one that scrubs its store on a schedule, say - pays for
-  // the check on every byte of every read and learns nothing new from it, and can set this.
-  //
-  // Applies to every read on the handle.
+  // Alias of `globals.trust_remote` for this handle: the handle trusts its remote when either is
+  // set, so payloads fetched from it have only their sizes checked against their length and are
+  // never hashed. Payloads the local store holds are never hashed either way.
   uint8_t skip_verify;
   // Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
   // incremental background GC for the handle; `0` then selects the default. Shared disk backends
@@ -5167,9 +5269,10 @@ typedef struct lore_storage_put_args_t {
 // A null pointer or zero length means no buffer is supplied, which is what a zero-initialized
 // value says, as does a length no allocation can have.
 //
-// The memory must stay valid, and reach nobody else, for the duration of the call it is passed to.
-// The buffers supplied by the items of one call must not overlap: the items run alongside each
-// other, so two covering the same byte would write it at once.
+// The memory must stay valid, and reach nobody else, until the call it is passed to completes: a
+// synchronous call returns, and an asynchronous one delivers `END`. The buffers supplied by the
+// items of one call must not overlap: the items run alongside each other, so two covering the same
+// byte would write it at once.
 typedef struct lore_bytes_mut_t {
   // Pointer to the start of the writable slice.
   void *ptr;
@@ -5246,8 +5349,13 @@ typedef struct lore_storage_get_resolved_item_t {
   // Cache fetched bytes back to the local store even without the producer's
   // `PayloadLocalCachePriority` hint
   uint8_t local_cache;
+  // Deliver one `GET_FRAGMENT` per leaf fragment in content order in place of `GET_DATA`, each
+  // carrying the leaf's fragment and its payload as stored, with `streaming` ignored. No leaf
+  // is expanded or checked against its hash. An item with `data_out` supplied rejects with
+  // `INVALID_ARGUMENTS`
+  uint8_t fragments;
   // Writable buffer receiving the content, `len` stating its capacity. Zero-initialized selects
-  // `GET_DATA` delivery.
+  // delivery in events.
   //
   // The capacity is the limit: content exceeding it fails the item with
   // `Oversized` rather than truncating. `GET_HEADER` reports the content
@@ -5736,6 +5844,11 @@ typedef struct lore_service_start_args_t {
 typedef struct lore_service_stop_args_t {
   int _unused;
 } lore_service_stop_args_t;
+
+// Arguments for querying the Lore service status (no parameters).
+typedef struct lore_service_status_args_t {
+  int _unused;
+} lore_service_status_args_t;
 
 // Arguments for naming the executable the Lore service runs from.
 typedef struct lore_service_set_executable_args_t {
@@ -6358,7 +6471,8 @@ void lore_auth_local_user_info_async(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested |
+// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
+// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
 // | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
 int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
                                     const struct lore_auth_login_interactive_args_t *args,
@@ -6385,7 +6499,8 @@ int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested |
+// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
+// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
 // | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
 void lore_auth_login_interactive_async(const struct lore_global_args_t *globals,
                                        const struct lore_auth_login_interactive_args_t *args,
@@ -9293,6 +9408,12 @@ void lore_link_update_async(const struct lore_global_args_t *globals,
 
 // Clone a remote repository to a local path.
 //
+// A clone needs the remote, so the `offline` global argument does not keep it from connecting: it
+// prepares the clone for working offline instead. With `offline` or `cache`, a clone that writes
+// its files caches every file metadata block of the cloned revision, which staging and committing
+// write to, so both work without the remote, and fails if it cannot. A bare clone writes no files
+// and reads them from the remote when a call needs them.
+//
 // # Events
 //
 // Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
@@ -9314,7 +9435,7 @@ void lore_link_update_async(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when clone begins, includes remote URL and target path |
 // | `LORE_EVENT_REPOSITORY_CLONE_PROGRESS` | `lore_repository_clone_progress_event_data_t` | Emitted periodically during clone with progress data |
-// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when clone completes successfully |
+// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted only when the clone succeeds; `LORE_EVENT_COMPLETE` reports the outcome of every clone |
 // | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted after resolving the target revision to sync during clone |
 // | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file written during initial sync |
 // | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during initial file sync |
@@ -9348,7 +9469,7 @@ int32_t lore_repository_clone(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when clone begins, includes remote URL and target path |
 // | `LORE_EVENT_REPOSITORY_CLONE_PROGRESS` | `lore_repository_clone_progress_event_data_t` | Emitted periodically during clone with progress data |
-// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when clone completes successfully |
+// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted only when the clone succeeds; `LORE_EVENT_COMPLETE` reports the outcome of every clone |
 // | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted after resolving the target revision to sync during clone |
 // | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file written during initial sync |
 // | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during initial file sync |
@@ -11557,12 +11678,17 @@ void lore_storage_get_async(const struct lore_global_args_t *globals,
 // materialised in memory before the first byte reaches the callback, so a key naming something
 // large should set it.
 //
+// Set `fragments` to receive one `LORE_EVENT_STORAGE_GET_FRAGMENT` per leaf fragment in place of
+// `LORE_EVENT_STORAGE_GET_DATA`, each carrying the leaf's `lore_fragment_t` and its payload as
+// stored. No leaf is expanded or checked against its hash.
+//
 // # Events
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_STORAGE_GET_HEADER` | `lore_storage_get_header_event_data_t` | Size of the item's reassembled content, emitted before any DATA events |
 // | `LORE_EVENT_STORAGE_GET_DATA` | `lore_storage_get_data_event_data_t` | Payload bytes — valid only during the callback invocation. One event per item, or one per leaf fragment when `streaming` is set |
+// | `LORE_EVENT_STORAGE_GET_FRAGMENT` | `lore_storage_get_fragment_event_data_t` | One leaf fragment and its payload, in content order, when `fragments` is set. The payload is valid only during the callback invocation |
 // | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event |
 // | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 // | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
@@ -11954,7 +12080,9 @@ void lore_service_start_async(const struct lore_global_args_t *globals,
 // Stop the running Lore background service.
 //
 // Does not start a service in order to stop one. Returns `0` when no service
-// is running, since that is the state the call asks for.
+// is running, since that is the state the call asks for. A mount the service
+// cannot release because something holds it refuses the stop with `MountsBusy`,
+// unless the global `force` argument is set, which detaches busy mounts lazily.
 //
 // # Events
 //
@@ -11993,6 +12121,67 @@ int32_t lore_service_stop(const struct lore_global_args_t *globals,
 void lore_service_stop_async(const struct lore_global_args_t *globals,
                              const struct lore_service_stop_args_t *args,
                              struct lore_event_callback_config_t callback);
+
+// Report whether the Lore background service is running, and its metadata.
+//
+// Answers from inside the service when called there, and otherwise reaches the
+// one that is listening. Nothing listening is an answer rather than a failure:
+// the call returns `0` with `running` set to `0`, so a caller branches on the
+// event rather than on a connection error. Also hands back the log messages the
+// service buffered while no command was running, emptying the buffer as it
+// reads it.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Operation-Specific Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_SERVICE_STATUS` | `lore_service_status_event_data_t` | Service running state and metadata |
+// | `LORE_EVENT_SERVICE_MESSAGE` | `lore_service_message_event_data_t` | A log message the service buffered outside command execution |
+int32_t lore_service_status(const struct lore_global_args_t *globals,
+                            const struct lore_service_status_args_t *args,
+                            struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_service_status`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Operation-Specific Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_SERVICE_STATUS` | `lore_service_status_event_data_t` | Service running state and metadata |
+// | `LORE_EVENT_SERVICE_MESSAGE` | `lore_service_message_event_data_t` | A log message the service buffered outside command execution |
+void lore_service_status_async(const struct lore_global_args_t *globals,
+                               const struct lore_service_status_args_t *args,
+                               struct lore_event_callback_config_t callback);
 
 // Name the executable the Lore background service runs from, for this machine.
 //
@@ -12204,7 +12393,10 @@ void lore_notification_unsubscribe_async(const struct lore_global_args_t *global
 int32_t lore_log_configure(const struct lore_log_config_t *config);
 
 // Shut the library down, stopping its worker threads and releasing the
-// resources it holds. Call this once, when no further calls will be made.
+// resources it holds. Call this once, when no further calls will be made and
+// every call made has completed. The library makes a best effort to cancel
+// calls still executing safely, but a call it does not stop in time may still
+// use the memory passed to it after this returns.
 //
 // Returns 0 on success and a non-zero value on failure.
 int32_t lore_shutdown(void);

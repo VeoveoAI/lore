@@ -18,8 +18,6 @@ mod logging;
 mod pager;
 mod print_macros;
 mod progress_bar;
-#[cfg(target_os = "linux")]
-mod sandbox;
 #[cfg(not(feature = "test-util"))]
 mod stats_display;
 #[cfg(feature = "test-util")]

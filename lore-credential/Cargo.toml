@@ -16,6 +16,7 @@ lore-base = { workspace = true }
 lore-error-set = { workspace = true }
 ring = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true, features = ["std"] }
 serde_with = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -23,6 +24,8 @@ toml = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+ctor = { workspace = true }
+lore-base = { workspace = true, features = ["test-util"] }
 lore-credential = { workspace = true, features = ["test-util"] }
 
 [features]
@@ -31,3 +34,6 @@ trace_log = ["lore-base/trace_log"]
 
 [target.'cfg(target_family = "windows")'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
+[lints]
+workspace = true

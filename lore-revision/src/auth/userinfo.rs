@@ -10,7 +10,6 @@ use lore_error_set::prelude::*;
 use lore_transport::Connection;
 use lore_transport::UserService;
 use lore_transport::auth::user_service;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::errors::*;
@@ -51,7 +50,7 @@ impl EventError for UserInfoError {
 
 /// Event data resolving a user identity to a display name.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreAuthUserInfoEventData {
     /// User identity
@@ -62,7 +61,7 @@ pub struct LoreAuthUserInfoEventData {
 
 /// Event data describing a stored authentication identity.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreAuthIdentityEventData {
     /// Auth service URL
@@ -92,7 +91,7 @@ async fn open_user_service(
     repository: RepositoryId,
     identity: &str,
 ) -> Result<UserServiceAccess, UserInfoError> {
-    let auth_url = remote.auth_url();
+    let auth_endpoint = remote.auth_endpoint();
     let user_url = remote.user_url().to_string();
     let execution = execution_context();
     let globals = execution.globals();
@@ -115,11 +114,11 @@ async fn open_user_service(
     }
 
     lore_debug!(
-        "Get authorization token for identity {identity} using auth url {auth_url} for service {user_url}"
+        "Get authorization token for identity {identity} using auth url {auth_endpoint} for service {user_url}"
     );
     let user_domain = get_domain_or_empty(&user_url);
     let token = lore_transport::auth::exchange::exchange(
-        auth_url,
+        auth_endpoint,
         identity,
         repository,
         user_domain.clone(),
@@ -299,7 +298,7 @@ pub async fn repository_access_token(
 
     lore_debug!("Get authorization token for identity {user_id} using auth url {auth_url}");
     let token = lore_transport::auth::exchange::exchange(
-        auth_url.as_str(),
+        remote.auth_endpoint(),
         user_id.as_str(),
         repository.id,
         remote_domain,
@@ -351,7 +350,7 @@ fn strip_current_user(ids: Vec<String>, current_user_id: &str) -> (bool, Vec<Str
 
 /// Event data carrying a user token along with the identity it belongs to.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreAuthUserTokenEventData {
     /// User identity

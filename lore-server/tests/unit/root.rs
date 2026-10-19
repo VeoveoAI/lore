@@ -15,6 +15,7 @@ use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
 use lore_storage::StoreObliterateStats;
+use lore_storage::immutable_store::CopyBehavior;
 
 /// An `ImmutableStore` that returns `SlowDown` on every operation.
 struct SlowDownImmutableStore;
@@ -107,7 +108,7 @@ impl ImmutableStore for SlowDownImmutableStore {
         _source_address: Address,
         _destination_partition: Partition,
         _destination_context: Context,
-        _durable: bool,
+        _behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         Err(StoreError::from(SlowDown))
     }
@@ -127,7 +128,7 @@ async fn slow_down_store_exhausts_retries_with_server_policy() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        lore_storage::read_raw(store, Partition::default(), address, false),
+        lore_storage::read_raw(store, Partition::default(), address),
     )
     .await
     .expect("read_raw did not return within 10s — server retry policy may not be active");

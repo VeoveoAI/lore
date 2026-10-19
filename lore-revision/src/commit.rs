@@ -12,10 +12,11 @@ use bytes::BytesMut;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_storage::FragmentWriteCounts;
-use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
 use zerocopy::FromBytes;
@@ -34,8 +35,8 @@ use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
+use crate::fs::hold;
 use crate::immutable;
-use crate::infer;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreMetadataType;
@@ -59,6 +60,7 @@ use crate::metadata;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataType;
 use crate::node;
+use crate::node::INVALID_NODE;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeDelta;
@@ -68,6 +70,8 @@ use crate::node::NodeFileMetadataFlags;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
+use crate::node::NodeLink;
+use crate::node::NodeNameLock;
 use crate::node::ROOT_NODE;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
 use crate::progress::DiscoveryStats;
@@ -77,6 +81,7 @@ use crate::repository::RepositoryWriteToken;
 use crate::repository::verify::verify_state_for_commit;
 use crate::revision::sync;
 use crate::state;
+use crate::state::LinkReference;
 use crate::state::NodeMapping;
 use crate::state::RecordedModifiedTimes;
 use crate::state::State;
@@ -89,7 +94,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Event data reported at the start of a commit.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitBeginEventData {
     /// Unused placeholder field.
@@ -98,7 +103,7 @@ pub struct LoreRevisionCommitBeginEventData {
 
 /// Progress counters describing how far a commit has advanced.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitCountData {
     /// Number of directories processed so far.
@@ -125,11 +130,17 @@ pub struct LoreRevisionCommitCountData {
 }
 
 impl LoreRevisionCommitCountData {
+    /// The counters as they stand. A count is incremented with `Release` once its total holds what
+    /// it counts, and loaded here with `Acquire` ahead of its total, so no count reads ahead of its
+    /// total.
+    #[lore_macro::test_pub]
     fn new(stats: Arc<CommitStats>) -> Self {
+        let directory_count = stats.complete.directory_count.load(Ordering::Acquire);
+        let file_count = stats.complete.file_count.load(Ordering::Acquire);
         Self {
-            directory_count: stats.complete.directory_count.load(Ordering::Relaxed),
+            directory_count,
             directory_total: stats.complete.directory_total.load(Ordering::Relaxed),
-            file_count: stats.complete.file_count.load(Ordering::Relaxed),
+            file_count,
             file_total: stats.complete.file_total.load(Ordering::Relaxed),
             directory_delete_count: stats
                 .complete
@@ -146,7 +157,7 @@ impl LoreRevisionCommitCountData {
 
 /// Event data reporting commit progress.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitProgressEventData {
     /// Current progress counters.
@@ -155,7 +166,7 @@ pub struct LoreRevisionCommitProgressEventData {
 
 /// Event data reported at the end of a commit.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitEndEventData {
     /// Final progress counters.
@@ -167,7 +178,9 @@ pub struct LoreRevisionCommitEndEventData {
 /// The actions are exclusive: a file is counted once, under the action its staged
 /// node flags name.
 #[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, bitcode::Encode, bitcode::Decode,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCommitFileStatsData {
     /// Files staged as new additions.
@@ -208,7 +221,7 @@ pub struct LoreCommitFileStatsData {
 /// statistics level one and above. A commit that failed reports what it had done
 /// by then.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitStatsEventData {
     /// Files committed, by action.
@@ -219,7 +232,7 @@ pub struct LoreRevisionCommitStatsEventData {
 
 /// Event data describing a revision produced by a commit.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionCommitRevisionEventData {
     /// Identifier of the repository the revision belongs to.
@@ -303,6 +316,7 @@ impl EventError for CommitError {
     }
 }
 
+#[lore_macro::test_pub]
 #[derive(Default)]
 struct CommitCompleteStats {
     pub directory_count: AtomicU64,
@@ -361,6 +375,26 @@ impl CommitStats {
             statistics: crate::runtime::try_execution_context()
                 .is_some_and(|context| context.globals().stats()),
         })
+    }
+
+    /// Counts one directory in the total and as done, the total first, as
+    /// [`LoreRevisionCommitCountData::new`] reads them.
+    #[lore_macro::test_pub]
+    fn count_directory(&self) {
+        self.complete
+            .directory_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.complete
+            .directory_count
+            .fetch_add(1, Ordering::Release);
+    }
+
+    /// Counts one file in the total and as done, the total first, as
+    /// [`LoreRevisionCommitCountData::new`] reads them.
+    #[lore_macro::test_pub]
+    fn count_file(&self) {
+        self.complete.file_total.fetch_add(1, Ordering::Relaxed);
+        self.complete.file_count.fetch_add(1, Ordering::Release);
     }
 
     /// One file was read off disk and fragmented. The byte total is what a
@@ -544,6 +578,10 @@ pub fn commit_boxed(
 ///
 /// The working tree is written to only where a commit resolves a staged merge conflict, which
 /// removes the copies that merge left beside the file.
+///
+/// A provider that holds its state is handed each revision the instance's repository commits
+/// ([`InstanceOperation::committed`]), and is refused a commit of a link alone or of a layer,
+/// which would make a revision current that it is not handed.
 #[lore_macro::test_pub]
 pub(crate) async fn commit_with_metadata(
     repository: Arc<RepositoryContext>,
@@ -572,8 +610,31 @@ async fn commit_with_metadata_in_operation(
     values: LoreArray<LoreString>,
     formats: LoreArray<LoreMetadataType>,
 ) -> Result<Hash, CommitError> {
+    if operation.holds_state() {
+        if options.link.is_some() {
+            return Err(hold::refused("commit a link alone").into());
+        }
+        if options.layer.is_some() {
+            return Err(hold::refused("commit a layer").into());
+        }
+    }
+
     let reporting = CommitReporting::from_globals();
     let _stats_report = reporting.report();
+
+    if !options.link_messages.is_empty() {
+        let (state_current, state_staged, _) =
+            State::deserialize_current_and_staged(repository.clone())
+                .await
+                .forward::<CommitError>("Failed to deserialize current and staged state")?;
+        link::validate_link_message_paths(
+            &state_staged.unwrap_or(state_current),
+            &repository,
+            options.link_messages.keys(),
+        )
+        .await
+        .forward::<CommitError>("validating link message paths")?;
+    }
 
     if let Some(ref link_path) = options.link {
         return commit_link_only(
@@ -618,6 +679,9 @@ async fn commit_with_metadata_in_operation(
 
 /// Commits the staged revision, then each layer staged beside it.
 ///
+/// A staged revision with nothing to commit while a layer has changes, such as one holding only
+/// dirty nodes, stays staged as it is, and the layers commit.
+///
 /// Its own future: inline, what it holds across its awaits would be reserved in the states of
 /// [`commit_with_metadata_in_operation`] that commit a link or a layer alone.
 #[allow(clippy::too_many_arguments)]
@@ -642,6 +706,13 @@ async fn commit_staged_with_layers(
         if !layer.staged.is_zero() && layer.staged != layer.current {
             layer_staged = true;
         }
+    }
+    if operation.holds_state()
+        && layers.iter().any(|layer| {
+            !layer.staged.is_zero() && (globals.force() || layer.staged != layer.current)
+        })
+    {
+        return Err(hold::refused("commit a layer").into());
     }
 
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
@@ -731,46 +802,54 @@ async fn commit_staged_with_layers(
 
     prune_dirty_for_commit(state_staged.clone(), repository.clone()).await?;
 
-    let mut signature = staged_revision;
+    let mut signature = current_revision;
     if current_revision != staged_revision {
         lore_debug!(
             "Committing revision, current revision {}, staged revision {}",
             state_current.revision(),
             state_staged.revision()
         );
-        let (committed, modified_times) = commit_staged_revision(
-            operation,
-            repository.clone(),
-            token.share(),
-            state_current.clone(),
-            state_staged.clone(),
-            RelativePath::new(),
-            ROOT_NODE,
-            metadata.clone(),
-            link_messages.clone(),
-            current_branch,
-            reporting.clone(),
-        )
-        .await?;
-        signature = committed;
+        'parent: {
+            let (committed, modified_times) = match commit_staged_revision(
+                operation,
+                repository.clone(),
+                token.share(),
+                state_current.clone(),
+                state_staged.clone(),
+                RelativePath::new(),
+                ROOT_NODE,
+                metadata.clone(),
+                link_messages.clone(),
+                current_branch,
+                reporting.clone(),
+            )
+            .await
+            {
+                Ok(committed) => committed,
+                Err(err) if layer_staged && err.is_nothing_staged() => break 'parent,
+                Err(err) => return Err(err),
+            };
+            signature = committed;
 
-        finalize_commit(
-            repository.clone(),
-            &state_current,
-            &state_staged,
-            branch_latest,
-            signature,
-            current_branch,
-            token,
-        )
-        .await?;
+            finalize_commit(
+                repository.clone(),
+                &state_current,
+                &state_staged,
+                branch_latest,
+                signature,
+                current_branch,
+                token,
+                Some(operation),
+            )
+            .await?;
 
-        modified_times.store(repository.clone()).await;
+            modified_times.store(repository.clone()).await;
 
-        event::metadata::send(&metadata);
+            event::metadata::send(&metadata);
+        }
     }
 
-    if !dry_run && !dirty_paths.is_empty() {
+    if !dry_run && signature != current_revision && !dirty_paths.is_empty() {
         crate::file::dirty::dirty_relative_paths_in_operation(
             operation,
             repository.clone(),
@@ -1213,7 +1292,7 @@ async fn commit_link_only(
         && link_effective_current == link_branch_latest
         && !link_branch_latest.is_zero()
     {
-        link_state_staged.set_parent_self(link_effective_current);
+        link_state_staged.reparent_onto(link_effective_current);
     }
 
     let metadata = build_commit_metadata(
@@ -1257,6 +1336,7 @@ async fn commit_link_only(
         link_signature,
         link_branch,
         &token,
+        None,
     )
     .await?;
 
@@ -1290,26 +1370,17 @@ async fn commit_link_only(
         .forward::<CommitError>("Failed to resolve link node in owning repository")?
         .node;
 
-    link::update_link_pin_by_node(
+    link::repin_link_node(
         &owner_state,
         owner_repository.clone(),
         resolved_staged.link_context.id,
         resolved_staged.link_reference.branch,
         link_signature,
         link_local_node,
+        NodeFlags::Staged,
     )
     .await
     .forward::<CommitError>("Failed to update link pin")?;
-
-    owner_state
-        .node_mark(
-            owner_repository.clone(),
-            link_local_node,
-            NodeFlags::Staged,
-            true,
-        )
-        .await
-        .forward::<CommitError>("Failed to mark link node as staged")?;
 
     // For a nested link, each intermediate link between the committed target
     // and the top-level repo must itself be COMMITTED (not just reserialized),
@@ -1323,7 +1394,7 @@ async fn commit_link_only(
         let child_current = State::deserialize(child_repository.clone(), level.old_signature)
             .await
             .forward::<CommitError>("Failed to deserialize intermediate link current state")?;
-        child_state.set_parent_self(level.old_signature);
+        child_state.reparent_onto(level.old_signature);
 
         let child_metadata = build_commit_metadata(
             child_repository.clone(),
@@ -1363,6 +1434,7 @@ async fn commit_link_only(
             child_signature,
             level.branch,
             &token,
+            None,
         )
         .await?;
 
@@ -1448,13 +1520,22 @@ async fn build_commit_metadata(
     .await
 }
 
-/// Stores branch latest, deletes staged anchor, updates last sync if merge,
-/// and emits the revision commit event.
+/// Stores branch latest, records the sync point of a merge of divergent history, keeps the dirty
+/// nodes left over in a staged anchor or deletes it, and emits the revision commit event.
+///
+/// The sync point is the merge's first parent, the remote latest it merged. A committed state whose
+/// second parent is the current revision is such a merge; its merge flag is cleared by then.
 ///
 /// `branch_previous` is what the pointer write compares against, so it must be
 /// the tip observed for `branch`, not the revision the caller built on: a prior
 /// link commit can advance the branch without committing the parent, which
 /// leaves that pin stale.
+///
+/// `reconciling` is the operation the commit read its files through, `None` for a link's own
+/// commit, which makes no revision of the instance current. Outside a dry run, where its provider
+/// holds its state, it is handed `state_staged` as stored once the revision is current
+/// ([`hand_over_committed`]), before it is reused as the staged anchor.
+#[allow(clippy::too_many_arguments)]
 async fn finalize_commit(
     repository: Arc<RepositoryContext>,
     state_current: &Arc<State>,
@@ -1463,6 +1544,7 @@ async fn finalize_commit(
     signature: Hash,
     branch: BranchId,
     token: &RepositoryWriteToken,
+    reconciling: Option<&InstanceOperationImpl>,
 ) -> Result<(), CommitError> {
     let dry_run = execution_context().globals().dry_run();
 
@@ -1474,6 +1556,20 @@ async fn finalize_commit(
             branch,
         )
         .await?;
+        if let Some(operation) = reconciling
+            && operation.holds_state()
+            && let Err(error) = hand_over_committed(&repository, operation, state_staged).await
+        {
+            lore_warn!(
+                "The filesystem provider did not take revision {signature} as committed: {error}"
+            );
+        }
+
+        if state_staged.parent_other() == state_current.revision()
+            && !state_current.revision().is_zero()
+        {
+            branch::store_last_sync(repository.clone(), branch, state_staged.parent_self()).await;
+        }
 
         // Check if any dirty-only nodes remain in the staged state.
         // If so, preserve them in a new staged anchor re-parented to the new revision.
@@ -1484,10 +1580,7 @@ async fn finalize_commit(
 
         if has_dirty {
             lore_debug!("Dirty nodes remain after commit, preserving in new staged anchor");
-            state_staged.set_parent_self(signature);
-            state_staged.set_revision_number(0);
-            state_staged.set_parent_other(Hash::default());
-            state_staged.set_metadata_hash(Hash::default());
+            state_staged.reparent_onto(signature);
             state_staged.mark_dirty();
 
             let staged_signature =
@@ -1500,10 +1593,6 @@ async fn finalize_commit(
                 .forward::<CommitError>("Failed to serialize staged anchor")?;
         } else {
             let _ = crate::instance::delete_staged_anchor(&repository).await;
-        }
-
-        if state_staged.parent_other() == state_current.revision() && state_staged.is_merge() {
-            branch::store_last_sync(repository.clone(), branch, state_staged.parent_self()).await;
         }
     }
 
@@ -1518,6 +1607,24 @@ async fn finalize_commit(
     .send();
 
     Ok(())
+}
+
+/// Hands `committed` to `operation`, whose provider holds its state, once the stores are flushed
+/// ([`InstanceOperation::committed`]). The provider may then drop the copies it kept of the files
+/// the commit read, which only a revision on disk replaces after a crash.
+async fn hand_over_committed(
+    repository: &Arc<RepositoryContext>,
+    operation: &InstanceOperationImpl,
+    committed: &Arc<State>,
+) -> Result<(), CommitError> {
+    repository
+        .flush(execution_context().globals().sync_data())
+        .await
+        .forward_any::<CommitError>("flushing the commit")?;
+    operation
+        .committed(repository.clone(), committed.clone())
+        .await
+        .forward::<CommitError>("handing the provider the committed revision")
 }
 
 /// Where a layer's commit starts: the node its configured source path names in the state being
@@ -1573,14 +1680,12 @@ async fn commit_staged_revision(
 
     let revision_current = state_current.revision();
     if state_staged.parent_self() != revision_current {
-        if globals.force() && revision_current == state_current.revision() {
-            // Force commit same revision, reset metadata
+        if state_staged.reconciles_divergent_history(revision_current) {
+            lore_debug!("Merge of divergent branch history, other parent is current revision");
+        } else if globals.force() {
             state_staged.set_parent_self(revision_current);
             state_staged.set_parent_other(Hash::default());
             state_staged.set_metadata_hash(Hash::default());
-        } else if state_staged.parent_other() == revision_current && state_staged.is_merge() {
-            // Merge of a divergent branch history
-            lore_debug!("Merge of divergent branch history, other parent is current revision");
         } else if state_staged.is_cherry_pick() {
             lore_debug!("Cherry-pick, other parent is empty");
         } else {
@@ -1600,10 +1705,11 @@ async fn commit_staged_revision(
     let tracker = immutable::commit_write_tracker(reporting.per_fragment);
 
     let work_tracker = tracker.clone();
-    let modified_times = Arc::new(RecordedModifiedTimes::default());
-    let collected = modified_times.clone();
     let operation = operation.clone();
     let work_result: Result<(Hash, Arc<RecordedModifiedTimes>), CommitError> = async move {
+        let collected = Arc::new(RecordedModifiedTimes::below(
+            operation.clock_floor(&repository).await,
+        ));
         // For each file in repository, create fragments if they don't already
         // exist. Also rehash directories affected by change and generate new
         // root hash.
@@ -1655,7 +1761,13 @@ async fn commit_staged_revision(
             lore_debug!("Force commit of identical merkle tree");
         }
 
-        weave_history(repository.clone(), state_staged.clone()).await?;
+        let based_on = if state_staged.parent_other() == revision_current && state_staged.is_merge()
+        {
+            BasedOn::Other
+        } else {
+            BasedOn::FirstParent
+        };
+        weave_history(repository.clone(), state_staged.clone(), based_on).await?;
 
         // Reset conflict/merge flags and transient link merge state
         state_staged.reset_merge_conflict_flags();
@@ -1770,36 +1882,24 @@ pub(crate) async fn commit_files_and_rehash(
     // Producer: discover staged files and directories
     let discover_stats = stats.clone();
     let producer = {
-        let operation = operation.clone();
-        let repository = repository.clone();
-        let token = token.share();
-        let state = state.clone();
-        let delta = delta.clone();
-        let discard = discard.clone();
-        let subnodes_to_discard = subnodes_to_discard.clone();
-        let stats = stats.clone();
-        let tracker = tracker.clone();
-        let dir_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS));
+        let walk = Arc::new(CommitWalk {
+            operation: operation.clone(),
+            repository: repository.clone(),
+            token: token.share(),
+            state: state.clone(),
+            delta: delta.clone(),
+            discard: discard.clone(),
+            subnodes_to_discard: subnodes_to_discard.clone(),
+            file_tx,
+            metadata,
+            link_messages,
+            stats: stats.clone(),
+            parent_branch,
+            tracker: tracker.clone(),
+            dir_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS)),
+        });
         lore_spawn!(async move {
-            let result = commit_directory(
-                operation,
-                repository,
-                token,
-                state,
-                relative_path,
-                node_id,
-                delta,
-                discard,
-                subnodes_to_discard,
-                file_tx,
-                metadata,
-                link_messages,
-                stats,
-                parent_branch,
-                tracker,
-                dir_semaphore,
-            )
-            .await;
+            let result = commit_directory(walk, relative_path, node_id, None).await;
             discover_stats
                 .discovery
                 .complete
@@ -1838,13 +1938,7 @@ pub(crate) async fn commit_files_and_rehash(
         })
     };
 
-    let (producer_result, consumer_result) = tokio::join!(producer, consumer);
-    producer_result
-        .internal("Recursion task failed")
-        .map_err(CommitError::from)??;
-    consumer_result
-        .internal("Recursion task failed")
-        .map_err(CommitError::from)??;
+    join_commit_tasks(producer, consumer).await?;
 
     commit_discard_subnodes(
         repository.clone(),
@@ -1901,7 +1995,9 @@ pub(crate) async fn rehash_tree_in_operation(
     branch: BranchId,
 ) -> Result<Arc<RecordedModifiedTimes>, CommitError> {
     let tracker = Arc::new(lore_storage::write_tracker::WriteTracker::new());
-    let modified_times = Arc::new(RecordedModifiedTimes::default());
+    let modified_times = Arc::new(RecordedModifiedTimes::below(
+        crate::state::read_clock_floor(&repository).await,
+    ));
     let rehashed = with_operation(repository.file_system(), async |operation| {
         commit_files_and_rehash(
             operation,
@@ -1927,6 +2023,7 @@ pub(crate) async fn rehash_tree_in_operation(
     Ok(modified_times)
 }
 
+#[lore_macro::test_pub]
 struct FileToCommit {
     node_id: NodeID,
     relative_path: RelativePath,
@@ -1944,14 +2041,13 @@ fn reject_unresolved_conflict(node: &Node, path: &str) -> Result<(), CommitError
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn commit_directory(
+/// What every directory of a commit walk reads and writes.
+#[lore_macro::test_pub]
+struct CommitWalk {
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
     state: Arc<State>,
-    relative_path: RelativePath,
-    node_id: NodeID,
     delta: Arc<parking_lot::RwLock<BytesMut>>,
     discard: Arc<parking_lot::RwLock<Vec<u32>>>,
     subnodes_to_discard: Arc<parking_lot::RwLock<Vec<NodeID>>>,
@@ -1962,294 +2058,273 @@ async fn commit_directory(
     parent_branch: BranchId,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
     dir_semaphore: Arc<Semaphore>,
-) -> Result<(), CommitError> {
-    let node_index = Node::index(node_id);
-    let block = state
-        .block_with_nametable(repository.clone(), NodeBlock::index(node_id))
-        .await
-        .forward::<CommitError>("Failed deserializing state block")?;
-    let node = block.node(node_index);
-
-    debug_assert!(node.is_directory());
-    lore_trace!(
-        "Committing directory node {} {} flags 0x{:x}",
-        node_id,
-        relative_path.as_str(),
-        node.flags
-    );
-
-    if node.is_staged() {
-        delta_add(delta.clone(), node_id, node.flags);
-    }
-
-    let mut updated = false;
-    let mut children =
-        StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id)
-            .await
-            .forward::<CommitError>("Failed deserializing state block")?;
-
-    let mut tasks = JoinSet::new();
-    let mut walk_failure = None;
-
-    loop {
-        let child = match children
-            .next()
-            .await
-            .forward::<CommitError>("Failed deserializing state block")
-        {
-            Ok(Some(child)) => child,
-            Ok(None) => break,
-            Err(err) => {
-                walk_failure = Some(err);
-                break;
-            }
-        };
-        let (child_node_id, child_node, node_name) = child;
-
-        if !child_node.is_staged() {
-            continue;
-        }
-
-        // Takes the name by value so its block read lock ends here, rather than reaching the
-        // commit of the child below (see NodeNameLock docs).
-        let relative_path = relative_path.push_into_buf(node_name).freeze();
-
-        debug_assert!(node.is_directory());
-        lore_trace!("Committing directory node {node_id} child {child_node_id}");
-
-        // A file is refused in `commit_file`, which also reads its markers from disk.
-        if !child_node.is_file()
-            && let Err(err) = reject_unresolved_conflict(&child_node, relative_path.as_str())
-        {
-            walk_failure = Some(err);
-            break;
-        }
-
-        if child_node.is_staged_delete() {
-            if child_node.is_directory() {
-                lore_spawn!(tasks, {
-                    let repository = repository.clone();
-                    let state = state.clone();
-                    let delta = delta.clone();
-                    let subnodes_to_discard = subnodes_to_discard.clone();
-                    let stats = stats.clone();
-                    async move {
-                        collect_discard_subnodes(
-                            repository,
-                            state,
-                            delta,
-                            child_node_id,
-                            subnodes_to_discard,
-                            stats,
-                        )
-                        .await
-                    }
-                });
-                updated = true;
-            }
-            discard.write().push(child_node_id);
-            if child_node.flags & NodeFlags::File != 0 {
-                stats.complete.file_total.fetch_add(1, Ordering::Relaxed);
-            } else {
-                stats
-                    .complete
-                    .directory_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        } else if child_node.is_directory() {
-            // Inline fallback rather than a blocking acquire: a parent awaiting
-            // its children must never block on a permit a descendant needs, or
-            // the bounded fan-out would deadlock.
-            match dir_semaphore.clone().try_acquire_owned() {
-                Ok(permit) => {
-                    lore_spawn!(tasks, {
-                        let operation = operation.clone();
-                        let repository = repository.clone();
-                        let token = token.share();
-                        let state = state.clone();
-                        let delta = delta.clone();
-                        let discard = discard.clone();
-                        let subnodes_to_discard = subnodes_to_discard.clone();
-                        let file_tx = file_tx.clone();
-                        let metadata = metadata.clone();
-                        let link_messages = link_messages.clone();
-                        let stats = stats.clone();
-                        let tracker = tracker.clone();
-                        let dir_semaphore = dir_semaphore.clone();
-                        async move {
-                            let _permit = permit;
-                            commit_directory_recurse(
-                                operation,
-                                repository,
-                                token,
-                                state,
-                                relative_path,
-                                child_node_id,
-                                delta,
-                                discard,
-                                subnodes_to_discard,
-                                file_tx,
-                                metadata,
-                                link_messages,
-                                stats,
-                                parent_branch,
-                                tracker,
-                                dir_semaphore,
-                            )
-                            .await
-                        }
-                    });
-                }
-                Err(_) => {
-                    if let Err(err) = commit_directory_recurse(
-                        operation.clone(),
-                        repository.clone(),
-                        token.share(),
-                        state.clone(),
-                        relative_path,
-                        child_node_id,
-                        delta.clone(),
-                        discard.clone(),
-                        subnodes_to_discard.clone(),
-                        file_tx.clone(),
-                        metadata.clone(),
-                        link_messages.clone(),
-                        stats.clone(),
-                        parent_branch,
-                        tracker.clone(),
-                        dir_semaphore.clone(),
-                    )
-                    .await
-                    {
-                        walk_failure = Some(err);
-                        break;
-                    }
-                }
-            }
-        } else if child_node.is_link() {
-            lore_debug!(
-                "Before committing link node, parent node {} address {}",
-                node_id,
-                node.address
-            );
-
-            lore_spawn!(tasks, {
-                let operation = operation.clone();
-                let repository = repository.clone();
-                let token = token.share();
-                let state = state.clone();
-                let delta = delta.clone();
-                let metadata = metadata.clone();
-                let link_messages = link_messages.clone();
-                let stats = stats.clone();
-                // commit_link builds its own per-link tracker so it can drain
-                // before emitting the sub-repo's RevisionCommitRevision event;
-                // the parent tracker is passed only to inherit its observer.
-                let parent_tracker = tracker.clone();
-                async move {
-                    commit_link_node(
-                        operation,
-                        repository,
-                        token,
-                        state,
-                        child_node_id,
-                        relative_path,
-                        delta,
-                        metadata,
-                        link_messages,
-                        stats,
-                        parent_branch,
-                        parent_tracker,
-                    )
-                    .await
-                }
-            });
-        } else if child_node.is_file() {
-            if let Err(err) = collect_file(
-                child_node_id,
-                relative_path,
-                &file_tx,
-                &stats,
-                child_node.size,
-            )
-            .await
-            {
-                walk_failure = Some(err);
-                break;
-            }
-            updated = true;
-        }
-    }
-
-    // Wait for all tasks to finish and gather any errors
-    let mut task_failure = Ok(());
-    let mut commit_failure = Ok(());
-    while let Some(task) = tasks.join_next().await {
-        if let Ok(result) = task {
-            if result.is_err() {
-                commit_failure = result;
-            }
-        } else {
-            task_failure = Err(task.unwrap_err());
-        }
-    }
-    if let Some(err) = walk_failure {
-        return Err(err);
-    }
-    commit_failure?;
-    task_failure.internal("Recursion task failed")?;
-
-    if updated {
-        stats
-            .complete
-            .directory_count
-            .fetch_add(1, Ordering::Relaxed);
-        stats
-            .complete
-            .directory_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn commit_directory_recurse(
-    operation: Arc<InstanceOperationImpl>,
-    repository: Arc<RepositoryContext>,
-    token: RepositoryWriteToken,
-    state: Arc<State>,
+/// The tasks a commit walk spawns.
+type CommitTasks = JoinSet<Result<(), CommitError>>;
+
+/// Commits the staged directory `node_id` at `relative_path`, and every staged directory below it
+/// that no task takes.
+///
+/// The walk is a loop over a stack of the directories it is inside rather than a recursion: a
+/// staged subdirectory goes to a task of its own while the directory budget lasts, and is entered at
+/// once otherwise, its parent resuming once it is left. So no directory is boxed, the stack grows
+/// with the tree's depth rather than with the subdirectories found, and it is allocated only once
+/// the budget is spent. Between directories the walk collects its finished tasks, and waits for one
+/// while more than [`MAX_CONCURRENT_TASKS`] run, so that the tasks of the directories it enters stay
+/// bounded. The first failure stops the walk, and is returned once every task has finished. The
+/// file channel closes once every walk sharing `walk` has finished.
+///
+/// `permit` is the budget a spawned walk holds until it has drained its tasks. Not an `async fn`,
+/// which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+fn commit_directory(
+    walk: Arc<CommitWalk>,
     relative_path: RelativePath,
     node_id: NodeID,
-    delta: Arc<parking_lot::RwLock<BytesMut>>,
-    discard: Arc<parking_lot::RwLock<Vec<u32>>>,
-    subnodes_to_discard: Arc<parking_lot::RwLock<Vec<NodeID>>>,
-    file_tx: mpsc::Sender<FileToCommit>,
-    metadata: Arc<Metadata>,
-    link_messages: Arc<HashMap<String, String>>,
-    stats: Arc<CommitStats>,
-    parent_branch: BranchId,
-    tracker: Arc<lore_storage::write_tracker::WriteTracker>,
-    dir_semaphore: Arc<Semaphore>,
-) -> Pin<Box<dyn Future<Output = Result<(), CommitError>> + Send>> {
-    Box::pin(commit_directory(
-        operation,
-        repository,
-        token,
-        state,
-        relative_path,
-        node_id,
-        delta,
-        discard,
-        subnodes_to_discard,
-        file_tx,
-        metadata,
-        link_messages,
-        stats,
-        parent_branch,
-        tracker,
-        dir_semaphore,
-    ))
+    permit: Option<OwnedSemaphorePermit>,
+) -> impl Future<Output = Result<(), CommitError>> {
+    async move {
+        let mut frame = CommitFrame::enter(&walk, relative_path, node_id).await?;
+        let mut ancestors = Vec::new();
+        let mut tasks = CommitTasks::new();
+        let mut failure = None;
+        loop {
+            match commit_directory_entries(&walk, &mut frame, &mut tasks).await {
+                Ok(Some(child)) => ancestors.push(std::mem::replace(&mut frame, child)),
+                Ok(None) => {
+                    let Some(parent) = ancestors.pop() else {
+                        frame.leave(&walk.stats);
+                        break;
+                    };
+                    std::mem::replace(&mut frame, parent).leave(&walk.stats);
+                }
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            }
+            while let Some(task) = tasks.try_join_next() {
+                collect_commit_task(task, &mut failure);
+            }
+            while tasks.len() > MAX_CONCURRENT_TASKS
+                && let Some(task) = tasks.join_next().await
+            {
+                collect_commit_task(task, &mut failure);
+            }
+            if failure.is_some() {
+                break;
+            }
+        }
+        while let Some(task) = tasks.join_next().await {
+            collect_commit_task(task, &mut failure);
+        }
+        drop(permit);
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+/// A directory a commit walk has entered and not yet left.
+struct CommitFrame {
+    relative_path: RelativePath,
+    node_id: NodeID,
+    children: StateNodeChildrenWithNameIterator,
+    updated: bool,
+}
+
+impl CommitFrame {
+    /// Enters the staged directory `node_id` at `relative_path`, adding the directory to the delta
+    /// when it is staged itself.
+    async fn enter(
+        walk: &CommitWalk,
+        relative_path: RelativePath,
+        node_id: NodeID,
+    ) -> Result<Self, CommitError> {
+        {
+            let block = walk
+                .state
+                .block_with_nametable(walk.repository.clone(), NodeBlock::index(node_id))
+                .await
+                .forward::<CommitError>("Failed deserializing state block")?;
+            let node = block.node(Node::index(node_id));
+            debug_assert!(node.is_directory());
+            lore_trace!(
+                "Committing directory node {} {} flags 0x{:x}",
+                node_id,
+                relative_path.as_str(),
+                node.flags
+            );
+            if node.is_staged() {
+                delta_add(walk.delta.clone(), node_id, node.flags);
+            }
+        }
+        let children = StateNodeChildrenWithNameIterator::new(
+            walk.state.clone(),
+            walk.repository.clone(),
+            node_id,
+        )
+        .await
+        .forward::<CommitError>("Failed deserializing state block")?;
+        Ok(Self {
+            relative_path,
+            node_id,
+            children,
+            updated: false,
+        })
+    }
+
+    /// Leaves the directory, counting it when a child of it was committed or discarded.
+    fn leave(self, stats: &CommitStats) {
+        if self.updated {
+            stats.count_directory();
+        }
+    }
+}
+
+/// Commits the staged children of `frame`'s directory from where it left off, and returns the first
+/// subdirectory past the walk's directory budget, entered, or `None` once every child is committed.
+async fn commit_directory_entries(
+    walk: &Arc<CommitWalk>,
+    frame: &mut CommitFrame,
+    tasks: &mut CommitTasks,
+) -> Result<Option<CommitFrame>, CommitError> {
+    loop {
+        let rest = {
+            let Some((child_node_id, child_node, node_name)) =
+                frame
+                    .children
+                    .next()
+                    .await
+                    .forward::<CommitError>("Failed deserializing state block")?
+            else {
+                return Ok(None);
+            };
+            commit_child(walk, frame, child_node_id, &child_node, node_name, tasks)?
+        };
+        match rest {
+            None => {}
+            Some(ChildRest::File(node_id, relative_path, size)) => {
+                collect_file(node_id, relative_path, &walk.file_tx, &walk.stats, size).await?;
+                frame.updated = true;
+            }
+            Some(ChildRest::Directory(node_id, relative_path)) => {
+                return CommitFrame::enter(walk, relative_path, node_id)
+                    .await
+                    .map(Some);
+            }
+        }
+    }
+}
+
+/// What committing a child leaves for the walk to await.
+enum ChildRest {
+    /// A file to send to the fragmenting, and its size.
+    File(NodeID, RelativePath, u64),
+    /// A subdirectory past the walk's directory budget, to enter.
+    Directory(NodeID, RelativePath),
+}
+
+/// Commits the child `child_node_id` of `frame`'s directory as far as it can without awaiting:
+/// rejects an unresolved conflict, discards a deleted child, and spawns a task per link, per deleted
+/// subdirectory, and per subdirectory while the walk's directory budget lasts. Returns what is left
+/// to await, or `None` for a child that is not staged or needs no more.
+///
+/// A plain function, so that the child's node is not held across the walk's awaits, and so that it
+/// can spawn [`commit_directory`], whose future holds that of [`commit_directory_entries`]: spawned
+/// there, it would need that future to be `Send` before its type is known. A subdirectory takes a
+/// permit only when one is free: a parent waiting on a permit a descendant needs would deadlock the
+/// bounded fan-out. A link's commit takes the walk's tracker only for its observer: `commit_link`
+/// builds a tracker of its own, so that it can drain before emitting the linked repository's
+/// `RevisionCommitRevision` event.
+fn commit_child(
+    walk: &Arc<CommitWalk>,
+    frame: &mut CommitFrame,
+    child_node_id: NodeID,
+    child_node: &Node,
+    node_name: NodeNameLock,
+    tasks: &mut CommitTasks,
+) -> Result<Option<ChildRest>, CommitError> {
+    if !child_node.is_staged() {
+        return Ok(None);
+    }
+
+    // Takes the name by value so its block read lock ends here, rather than reaching the
+    // commit of the child below (see NodeNameLock docs).
+    let relative_path = frame.relative_path.push_into_buf(node_name).freeze();
+
+    lore_trace!(
+        "Committing directory node {} child {child_node_id}",
+        frame.node_id
+    );
+
+    // A file is refused in `commit_file`, which also reads its markers from disk.
+    if !child_node.is_file() {
+        reject_unresolved_conflict(child_node, relative_path.as_str())?;
+    }
+
+    if child_node.is_staged_delete() {
+        if child_node.is_directory() {
+            lore_spawn!(
+                tasks,
+                collect_discard_subnodes(
+                    walk.repository.clone(),
+                    walk.state.clone(),
+                    walk.delta.clone(),
+                    child_node_id,
+                    walk.subnodes_to_discard.clone(),
+                    walk.stats.clone(),
+                )
+            );
+            frame.updated = true;
+        }
+        walk.discard.write().push(child_node_id);
+        if child_node.flags & NodeFlags::File != 0 {
+            walk.stats
+                .complete
+                .file_total
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            walk.stats
+                .complete
+                .directory_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    } else if child_node.is_directory() {
+        let Ok(permit) = walk.dir_semaphore.clone().try_acquire_owned() else {
+            return Ok(Some(ChildRest::Directory(child_node_id, relative_path)));
+        };
+        lore_spawn!(
+            tasks,
+            commit_directory(walk.clone(), relative_path, child_node_id, Some(permit))
+        );
+    } else if child_node.is_link() {
+        lore_debug!("Before committing link node, parent node {}", frame.node_id);
+        lore_spawn!(
+            tasks,
+            commit_link_node(
+                walk.operation.clone(),
+                walk.repository.clone(),
+                walk.token.share(),
+                walk.state.clone(),
+                child_node_id,
+                relative_path,
+                walk.delta.clone(),
+                walk.metadata.clone(),
+                walk.link_messages.clone(),
+                walk.stats.clone(),
+                walk.parent_branch,
+                walk.tracker.clone(),
+            )
+        );
+    } else if child_node.is_file() {
+        return Ok(Some(ChildRest::File(
+            child_node_id,
+            relative_path,
+            child_node.size,
+        )));
+    }
+    Ok(None)
 }
 
 async fn collect_discard_subnodes(
@@ -2335,7 +2410,7 @@ async fn commit_discard_subnodes(
                     true,
                     move |_discarded_node_id, flags| {
                         if flags & NodeFlags::File != 0 {
-                            stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
+                            stats.complete.file_count.fetch_add(1, Ordering::Release);
                             stats
                                 .complete
                                 .file_delete_count
@@ -2344,7 +2419,7 @@ async fn commit_discard_subnodes(
                             stats
                                 .complete
                                 .directory_count
-                                .fetch_add(1, Ordering::Relaxed);
+                                .fetch_add(1, Ordering::Release);
                             stats
                                 .complete
                                 .directory_delete_count
@@ -2404,7 +2479,7 @@ async fn commit_discard(
             move |discarded_node_id, flags| {
                 delta_add(delta.clone(), discarded_node_id, flags);
                 if flags & NodeFlags::File != 0 {
-                    stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
+                    stats.complete.file_count.fetch_add(1, Ordering::Release);
                     stats
                         .complete
                         .file_delete_count
@@ -2413,7 +2488,7 @@ async fn commit_discard(
                     stats
                         .complete
                         .directory_count
-                        .fetch_add(1, Ordering::Relaxed);
+                        .fetch_add(1, Ordering::Release);
                     stats
                         .complete
                         .directory_delete_count
@@ -2450,8 +2525,11 @@ async fn collect_file(
     Ok(())
 }
 
-/// Folds a finished [`commit_file`] task into the first failure seen.
-fn collect_committed_file(
+/// The most tasks a commit's walk or file stage keeps running before it waits for one to finish.
+const MAX_CONCURRENT_TASKS: usize = 10000;
+
+/// Folds a finished task of a commit into the first failure seen.
+fn collect_commit_task(
     result: Result<Result<(), CommitError>, tokio::task::JoinError>,
     failure: &mut Option<CommitError>,
 ) {
@@ -2465,6 +2543,25 @@ fn collect_committed_file(
     }
 }
 
+/// Waits for a commit's discovery task and the task fragmenting the files it finds, and reports a
+/// failure to fragment a file ahead of a failure in discovery. Discovery fails once fragmenting
+/// stops taking files, so its error is then a result of the failure to fragment.
+#[lore_macro::test_pub]
+async fn join_commit_tasks(
+    discovery: JoinHandle<Result<(), CommitError>>,
+    fragmenting: JoinHandle<Result<(), CommitError>>,
+) -> Result<(), CommitError> {
+    let (discovery, fragmenting) = tokio::join!(discovery, fragmenting);
+    let discovery = discovery
+        .internal("Recursion task failed")
+        .map_err(CommitError::from)?;
+    let fragmenting = fragmenting
+        .internal("Recursion task failed")
+        .map_err(CommitError::from)?;
+    fragmenting?;
+    discovery
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn commit_execute(
     operation: Arc<InstanceOperationImpl>,
@@ -2476,7 +2573,6 @@ async fn commit_execute(
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
     modified_times: Arc<RecordedModifiedTimes>,
 ) -> Result<(), CommitError> {
-    const MAX_CONCURRENT_TASKS: usize = 10000;
     let mut tasks = JoinSet::new();
     let mut commit_failure = None;
 
@@ -2497,12 +2593,12 @@ async fn commit_execute(
         );
 
         while let Some(result) = tasks.try_join_next() {
-            collect_committed_file(result, &mut commit_failure);
+            collect_commit_task(result, &mut commit_failure);
         }
         while tasks.len() > MAX_CONCURRENT_TASKS
             && let Some(result) = tasks.join_next().await
         {
-            collect_committed_file(result, &mut commit_failure);
+            collect_commit_task(result, &mut commit_failure);
         }
 
         if commit_failure.is_some() {
@@ -2511,7 +2607,7 @@ async fn commit_execute(
     }
 
     while let Some(result) = tasks.join_next().await {
-        collect_committed_file(result, &mut commit_failure);
+        collect_commit_task(result, &mut commit_failure);
     }
 
     if let Some(err) = commit_failure {
@@ -2545,8 +2641,9 @@ async fn info_before_fragmenting(
     Ok(info)
 }
 
-/// Commits one file node, recording the modified time it read the file at. A view-excluded
-/// path records nothing: its content is taken from the staged node rather than disk.
+/// Commits one file node, recording the modified time it read the file at and telling the
+/// operation what it stored ([`InstanceOperation::stored`]). A view-excluded path records and
+/// tells nothing: its content is taken from the staged node rather than disk.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -2572,19 +2669,32 @@ fn commit_file(
 
         debug_assert!(node.is_file());
 
+        // A sparse checkout has no working-tree file for a view-excluded path, so
+        // the staged content hash is the only source and no markers are read.
+        // Re-fragmenting would read a file that is absent or stale.
+        //
+        // This test must stay identical to the one realize gates disk writes on
+        // (`fs/realize.rs`), because that is what decided whether the file was
+        // written.
+        let excluded = repository
+            .filter
+            .excludes_tree(&relative_path, false, FilterMode::View);
+
         if node.is_staged_merge_conflict() {
             reject_unresolved_conflict(&node, relative_path.as_str())?;
-            // Check if file has conflict markers remaining
-            if infer::infer_is_conflicted(&operation.content_source(&relative_path))
-                .await
-                .internal_with(|| format!("Failed reading file {}", relative_path.as_str()))?
+            if !excluded
+                && operation
+                    .infer_is_conflicted(&relative_path)
+                    .await
+                    .forward_with::<CommitError, _>(|| {
+                        format!("checking {relative_path} for conflict markers")
+                    })?
             {
                 return Err(Conflict {
                     path: relative_path.as_str().to_string(),
                 }
                 .into());
             }
-            // Clean up theirs/base files
             if !execution_context().globals().dry_run() {
                 sync::unlink_merge_artifacts(&operation, &relative_path).await;
             }
@@ -2597,56 +2707,48 @@ fn commit_file(
             node.flags
         );
 
-        // A sparse checkout has no working-tree file for a view-excluded path, so
-        // the staged content hash is the only source. Re-fragmenting would read a
-        // file that is absent or stale.
-        //
-        // This test must stay identical to the one realize gates disk writes on
-        // (`fs/realize.rs`), because that is what decided whether the file was
-        // written.
-        let (address, content_size, mode, modified_time) =
-            if repository
-                .filter
-                .excludes_tree(&relative_path, false, FilterMode::View)
-            {
-                (node.address, node.size, node.mode, None)
-            } else {
-                if node.address.context.is_zero() {
-                    // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
-                    node.address.context = uuid::Uuid::now_v7().into();
-                    lore_trace!(
-                        "Generate file ID for file: {} {}",
-                        relative_path.as_str(),
-                        node.address.context
-                    );
-                }
+        let (address, content_size, mode, modified_time) = if excluded {
+            (node.address, node.size, node.mode, None)
+        } else {
+            if node.address.context.is_zero() {
+                // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
+                node.address.context = uuid::Uuid::now_v7().into();
+                lore_trace!(
+                    "Generate file ID for file: {} {}",
+                    relative_path.as_str(),
+                    node.address.context
+                );
+            }
 
-                let info = info_before_fragmenting(&operation, &relative_path).await?;
+            let info = info_before_fragmenting(&operation, &relative_path).await?;
 
-                let (address, size_content) = immutable::write_from_file_with_tracker(
-                    repository.clone(),
-                    &operation.content_source(&relative_path),
-                    node.address.context,
-                    immutable::write_options_from_repository(repository.clone()),
-                    Some(tracker),
-                )
+            let source = operation
+                .content_source(&relative_path)
                 .await
                 .forward_with::<CommitError, _>(|| {
-                    format!(
-                        "Failed writing file {} to immutable store",
-                        relative_path.as_str()
-                    )
+                    format!("naming the content of {relative_path}")
                 })?;
-
-                stats.file_read(size_content);
-
-                (
-                    address,
-                    size_content,
-                    info.mode(node.mode),
-                    Some(info.mtime()),
+            let (address, size_content) = immutable::write_from_file_with_tracker(
+                repository.clone(),
+                &source,
+                node.address.context,
+                immutable::write_options_from_repository(repository.clone()),
+                Some(tracker),
+            )
+            .await
+            .forward_with::<CommitError, _>(|| {
+                format!(
+                    "Failed writing file {} to immutable store",
+                    relative_path.as_str()
                 )
-            };
+            })?;
+
+            stats.file_read(size_content);
+            let mode = info.mode(node.mode);
+            operation.stored(&relative_path, address, size_content, mode);
+
+            (address, size_content, mode, Some(info.mtime()))
+        };
 
         let modified = util::fs::mode_changed(node.mode, mode)
             || node.size != content_size
@@ -2714,7 +2816,7 @@ fn commit_file(
             modified_times.record(&repository, &relative_path, modified_time);
         }
 
-        stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
+        stats.complete.file_count.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -2735,7 +2837,6 @@ async fn commit_link_node(
     parent_branch: BranchId,
     parent_tracker: Arc<lore_storage::write_tracker::WriteTracker>,
 ) -> Result<(), CommitError> {
-    // First check if this was an initial add of the link
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
 
@@ -2745,7 +2846,16 @@ async fn commit_link_node(
         .forward::<CommitError>("Failed deserializing state block")?;
     let node = block.node(node_index);
 
-    if node.is_staged_add() {
+    let link = node.linked_node();
+    let link_node = link.node;
+    let (link_repository, link_state) = link
+        .open(&repository)
+        .await
+        .forward::<CommitError>("Failed to deserialize link state")?;
+
+    // An added link pinned at a committed revision has nothing inside it to commit; one pinned at
+    // an uncommitted state, as dirtying or staging inside it leaves, goes through `commit_link`.
+    if node.is_staged_add() && link_state.revision_number() != 0 {
         lore_trace!("Reset staged add flag on link node {relative_path}");
 
         delta_add(delta, node_id, node.flags);
@@ -2767,20 +2877,13 @@ async fn commit_link_node(
     // Link, recurse and check if there are changes inside the link to commit, and if so update the
     // target repository hash and potentially target node index in this node data
 
-    let link = node.linked_node();
-    let link_repository = repository.to_link_context(link.repository).await;
-    let signature = link.revision;
-    let link_node = link.node;
-    let link_state = State::deserialize(link_repository.clone(), signature)
-        .await
-        .forward::<CommitError>("Failed to deserialize link state")?;
-
     let link_reference = state
         .link_find(repository.clone(), link.repository, node_id)
         .await
         .forward::<CommitError>("Commit of link node failed")?;
 
     let branch_id = link_reference.resolve_branch(parent_branch);
+    let based_on = link_based_on(&repository, &state, &link_reference, &link_state).await?;
 
     let link_metadata = if let Some(link_msg) = link_messages.get(relative_path.as_str()) {
         let mut overridden = (*metadata).clone();
@@ -2800,7 +2903,7 @@ async fn commit_link_node(
         relative_path,
         link_node,
         branch_id,
-        signature,
+        based_on,
         link_metadata,
         link_messages,
         stats,
@@ -2860,6 +2963,32 @@ async fn commit_link_node(
     Ok(())
 }
 
+/// The revision the tree of the linked state `link_state` was built from. A merge of the link's
+/// divergent history is staged on the pin the link held before the merge, which the parent `state`
+/// keeps in its link merge state, and takes that pin as its second parent.
+async fn link_based_on(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    link_reference: &LinkReference,
+    link_state: &State,
+) -> Result<BasedOn, CommitError> {
+    if !link_state.is_merge() {
+        return Ok(BasedOn::FirstParent);
+    }
+    let pinned = state
+        .deserialize_link_merge_state(repository.clone())
+        .await
+        .forward::<CommitError>("Failed reading link merge state")?
+        .into_iter()
+        .find(|entry| entry.local_node == link_reference.local_node)
+        .map(|entry| entry.base.signature);
+    Ok(if pinned == Some(link_state.parent_other()) {
+        BasedOn::Other
+    } else {
+        BasedOn::FirstParent
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn commit_link(
     operation: Arc<InstanceOperationImpl>,
@@ -2869,7 +2998,7 @@ async fn commit_link(
     relative_path: RelativePath,
     node_id: NodeID,
     branch: BranchId,
-    current_revision: Hash,
+    based_on: BasedOn,
     metadata: Arc<Metadata>,
     link_messages: Arc<HashMap<String, String>>,
     stats: Arc<CommitStats>,
@@ -2885,6 +3014,9 @@ async fn commit_link(
     lore_debug!("Committing link node {node_id} at {relative_path}");
 
     prune_dirty_for_commit(state.clone(), repository.clone()).await?;
+    let link_modified_times = Arc::new(RecordedModifiedTimes::below(
+        operation.clock_floor(&repository).await,
+    ));
 
     // Observed before any write, so the pointer write below compares against the
     // tip this commit was built on rather than one a racing committer published.
@@ -2898,7 +3030,6 @@ async fn commit_link(
     // success do we emit the event. `Ok(None)` signals the "unchanged link"
     // case — no new revision, no event.
     let work_tracker = link_tracker.clone();
-    let link_modified_times = Arc::new(RecordedModifiedTimes::default());
     let work_result: Result<Option<Hash>, CommitError> = {
         let repository = repository.clone();
         let state = state.clone();
@@ -2918,44 +3049,28 @@ async fn commit_link(
             let link_branch = branch;
 
             let producer = {
-                let operation = operation.clone();
-                let repository = repository.clone();
-                let token = token.share();
-                let state = state.clone();
-                let delta = delta.clone();
-                let discard = discard.clone();
-                let subnodes_to_discard = subnodes_to_discard.clone();
-                let metadata = metadata.clone();
-                let link_messages = link_messages.clone();
-                let stats = stats.clone();
-                let tracker = work_tracker.clone();
-                // Own budget per linked sub-repo, isolated from the parent's.
-                let dir_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS));
-                lore_spawn!(async move {
-                    commit_directory_recurse(
-                        operation,
-                        repository,
-                        token,
-                        state,
-                        relative_path,
-                        node_id,
-                        delta,
-                        discard,
-                        subnodes_to_discard,
-                        file_tx,
-                        metadata,
-                        // Per-link messages are keyed by full mount path, so a
-                        // nested link (e.g. `vendor/b/vendor/c`) still receives
-                        // its `--link-message`; it falls back to the main
-                        // message when no entry matches.
-                        link_messages,
-                        stats,
-                        link_branch,
-                        tracker,
-                        dir_semaphore,
-                    )
-                    .await
-                })
+                let walk = Arc::new(CommitWalk {
+                    operation: operation.clone(),
+                    repository: repository.clone(),
+                    token: token.share(),
+                    state: state.clone(),
+                    delta: delta.clone(),
+                    discard: discard.clone(),
+                    subnodes_to_discard: subnodes_to_discard.clone(),
+                    file_tx,
+                    metadata: metadata.clone(),
+                    // Per-link messages are keyed by full mount path, so a
+                    // nested link (e.g. `vendor/b/vendor/c`) still receives
+                    // its `--link-message`; it falls back to the main
+                    // message when no entry matches.
+                    link_messages: link_messages.clone(),
+                    stats: stats.clone(),
+                    parent_branch: link_branch,
+                    tracker: work_tracker.clone(),
+                    // Own budget per linked sub-repo, isolated from the parent's.
+                    dir_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS)),
+                });
+                lore_spawn!(commit_directory(walk, relative_path, node_id, None))
             };
 
             let consumer = {
@@ -2981,13 +3096,7 @@ async fn commit_link(
                 })
             };
 
-            let (producer_result, consumer_result) = tokio::join!(producer, consumer);
-            producer_result
-                .internal("Recursion task failed")
-                .map_err(CommitError::from)??;
-            consumer_result
-                .internal("Recursion task failed")
-                .map_err(CommitError::from)??;
+            join_commit_tasks(producer, consumer).await?;
 
             commit_discard_subnodes(
                 repository.clone(),
@@ -3038,7 +3147,7 @@ async fn commit_link(
                     .forward::<CommitError>("Failed to write commit metadata")?,
             );
 
-            weave_history(repository.clone(), state.clone()).await?;
+            weave_history(repository.clone(), state.clone(), based_on).await?;
 
             state.reset_merge_conflict_flags();
             state.clear_link_merge_state();
@@ -3081,11 +3190,12 @@ async fn commit_link(
         Err(e) => return Err(e),
     };
 
-    // Unchanged link: no new revision, no event to emit. Return early with
-    // the pre-existing revision/node so the parent keeps its current pin.
+    // Unchanged link: no new revision, no event to emit. Return early with the committed revision
+    // the pinned state is based on, which is the pin itself unless the state holds dirty markers
+    // alone.
     let signature = match signature_opt {
         Some(sig) => sig,
-        None => return Ok((current_revision, node_id)),
+        None => return Ok((state.committed_revision(), node_id)),
     };
 
     // For linked repos, RevisionCommitRevision emission is strictly after
@@ -3380,9 +3490,34 @@ async fn generate_delta_block(
     Ok(())
 }
 
+/// The revision the tree of a revision was built from, which the tree shares node IDs with.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BasedOn {
+    /// The first parent, as for a revision committed on top of it.
+    FirstParent,
+    /// Another revision: the second parent of a merge reconciling divergent history, which is
+    /// staged on the current revision and takes it as the second parent. The nodes the first
+    /// parent added since the two diverged can have other IDs in the tree.
+    Other,
+}
+
+/// Records in the file metadata of `state` what its parents changed. A node the first parent's
+/// own delta changed records the first parent as its last change on the first-parent line. A
+/// node the merge changed records the second parent's history of it, and a node the second
+/// parent's own delta changed records the second parent on the second-parent line. Every other
+/// node keeps the history of the tree `state` was built from.
+///
+/// The first parent's delta is recorded by node ID when the tree of `state` is
+/// [based on](BasedOn) the first parent. Otherwise it is recorded on the
+/// [counterpart](find_counterpart_node) of each node, and a node the merge changed first takes
+/// the first parent's history of its counterpart. The second parent's history is recorded on the
+/// node at the same path.
+#[lore_macro::test_pub]
 pub(crate) async fn weave_history(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
+    based_on: BasedOn,
 ) -> Result<(), CommitError> {
     let [parent_self, parent_other] = state.parents();
     let mut history_count = 0;
@@ -3407,57 +3542,39 @@ pub(crate) async fn weave_history(
             .to_aligned::<NodeDelta>();
 
         let delta_slice = delta_buffer.as_type_slice::<NodeDelta>();
-        let mut idelta = 1;
 
         lore_debug!("Weaving {} delta entries", delta_slice.len());
-        for delta in delta_slice.iter() {
-            if delta.action == FileAction::Delete as u16 {
-                // Deleted files no longer exist in the tree node
-                continue;
-            }
+        if based_on == BasedOn::Other {
+            history_count += Box::pin(weave_first_parent_counterparts(
+                &repository,
+                &state,
+                &state_parent,
+                delta_slice,
+            ))
+            .await?;
+        } else {
+            for delta in delta_slice.iter() {
+                if delta.action == FileAction::Delete as u16 {
+                    // Deleted files no longer exist in the tree node
+                    continue;
+                }
 
-            let node_id = delta.node;
-
-            let metadata_node = node::node_to_file_metadata(node_id);
-            let block_index = NodeFileMetadataBlock::index(metadata_node);
-            let node_index = NodeFileMetadata::index(metadata_node);
-
-            let file_metadata_block = state
-                .block_file_metadata(repository.clone(), block_index)
-                .await
-                .forward::<CommitError>("Failed deserializing file metadata block")?;
-
-            let dirtied = {
-                let mut block_writer = file_metadata_block.write();
-                let node = block_writer.node(node_index);
-
-                node.revision[0] = parent_self;
-                node.revision[1] = Hash::default();
-                node.node[0] = node_id;
-                node.node[1] = 0;
-                node.action[0] = delta.action;
-                node.flags[0] = delta.flags;
-                node.action[1] = change::FileAction::Keep as u16;
-                node.flags[1] = NodeFileMetadataFlags::NoFlag.bits();
-                history_count += 1;
-
-                lore_trace!(
-                    "History {}/{}: node {} {:?}",
-                    idelta,
-                    delta_slice.len(),
-                    node_id,
-                    node
+                let metadata_node = node::node_to_file_metadata(delta.node);
+                let block_index = NodeFileMetadataBlock::index(metadata_node);
+                let file_metadata_block = state
+                    .block_file_metadata(repository.clone(), block_index)
+                    .await
+                    .forward::<CommitError>("Failed deserializing file metadata block")?;
+                record_first_parent_change(
+                    &state,
+                    file_metadata_block,
+                    block_index,
+                    NodeFileMetadata::index(metadata_node),
+                    parent_self,
+                    delta,
                 );
-
-                block_writer.mark_dirty()
-            };
-
-            if dirtied {
-                state.block_file_metadata_modified(file_metadata_block, block_index);
-                state.mark_dirty();
+                history_count += 1;
             }
-
-            idelta += 1;
         }
     }
 
@@ -3494,16 +3611,15 @@ pub(crate) async fn weave_history(
                     .await
                     .forward::<CommitError>("Failed constructing node path when weaving history")?;
 
-                let node_parent = state_parent
-                    .find_node_link(repository.clone(), node_path.as_str())
-                    .await
-                    .unwrap_or_default();
-                if !node_parent.is_valid() {
-                    // Node does not exist in the branch being merged in
+                let Some(node_parent) =
+                    node_at_path(&repository, &state_parent, node_path.as_str())
+                        .await
+                        .unwrap_or_default()
+                else {
                     continue;
-                }
+                };
 
-                let metadata_node = node::node_to_file_metadata(node_parent.node);
+                let metadata_node = node::node_to_file_metadata(node_parent);
                 let block_index = NodeFileMetadataBlock::index(metadata_node);
                 let node_index = NodeFileMetadata::index(metadata_node);
 
@@ -3528,7 +3644,7 @@ pub(crate) async fn weave_history(
                     let node = block_writer.node(node_index);
 
                     node.revision[1] = merge_metadata.revision[0];
-                    node.node[1] = node_parent.node;
+                    node.node[1] = merge_metadata.node[0];
                     node.flags[1] |= merge_metadata.flags[0] | change::Flags::Merge.bits();
                     node.action[1] = merge_metadata.action[0];
 
@@ -3578,11 +3694,10 @@ pub(crate) async fn weave_history(
                 continue;
             };
 
-            let node_link = state
-                .find_node_link(repository.clone(), node_path.as_str())
+            let Some(current_node_id) = node_at_path(&repository, &state, node_path.as_str())
                 .await
-                .unwrap_or_default();
-            if !node_link.node.is_valid_node_id() {
+                .unwrap_or_default()
+            else {
                 // This node does not exist in the current state, it was deleted as part of the
                 // merge conflict resolution, or deleted in the incoming branch revision.
                 // TODO(mjansson): For the rename case where the node as renamed/moved as part
@@ -3592,9 +3707,8 @@ pub(crate) async fn weave_history(
                     "Ignore weaving history for path that does not exist in current state: {node_path}"
                 );
                 continue;
-            }
+            };
 
-            let current_node_id = node_link.node;
             let metadata_node = node::node_to_file_metadata(current_node_id);
             let block_index = NodeFileMetadataBlock::index(metadata_node);
             let node_index = NodeFileMetadata::index(metadata_node);
@@ -3646,6 +3760,224 @@ pub(crate) async fn weave_history(
     Ok(())
 }
 
+/// Records the first parent's history on a tree of `state` built from another revision. A node the
+/// merge changed takes the history the first parent `state_parent` holds for its
+/// [counterpart](find_counterpart_node), and a node `delta_slice`, the first parent's own delta,
+/// changed records the first parent on its counterpart. A node either delta deletes is skipped.
+/// Returns the count of nodes recorded.
+///
+/// Boxed by the caller: a tree is built from another revision than its first parent only for a
+/// merge reconciling divergent history.
+async fn weave_first_parent_counterparts(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    state_parent: &State,
+    delta_slice: &[NodeDelta],
+) -> Result<u32, CommitError> {
+    let block_count = state
+        .tree(repository.clone())
+        .await
+        .forward::<CommitError>("Failed reading tree when weaving history")?
+        .block_count;
+    let parent_block_count = state_parent
+        .tree(repository.clone())
+        .await
+        .forward::<CommitError>("Failed reading parent tree when weaving history")?
+        .block_count;
+    let mut history_count = 0;
+
+    let merge_buffer = state
+        .delta_block(repository.clone())
+        .await
+        .forward::<CommitError>("Failed deserializing state delta block when weaving history")?
+        .to_aligned::<NodeDelta>();
+    for delta in merge_buffer.as_type_slice::<NodeDelta>() {
+        if delta.flags & change::Flags::Merge == 0 || delta.action == FileAction::Delete as u16 {
+            continue;
+        }
+
+        let Some(parent_node) = find_counterpart_node(
+            repository,
+            state,
+            delta.node,
+            state_parent,
+            parent_block_count,
+        )
+        .await?
+        else {
+            continue;
+        };
+        copy_first_parent_history(repository, state, delta.node, state_parent, parent_node).await?;
+        history_count += 1;
+    }
+
+    for delta in delta_slice {
+        if delta.action == FileAction::Delete as u16 {
+            continue;
+        }
+
+        let Some(node_id) =
+            find_counterpart_node(repository, state_parent, delta.node, state, block_count).await?
+        else {
+            continue;
+        };
+        let metadata_node = node::node_to_file_metadata(node_id);
+        let block_index = NodeFileMetadataBlock::index(metadata_node);
+        let file_metadata_block = state
+            .block_file_metadata(repository.clone(), block_index)
+            .await
+            .forward::<CommitError>("Failed deserializing file metadata block")?;
+        record_first_parent_change(
+            state,
+            file_metadata_block,
+            block_index,
+            NodeFileMetadata::index(metadata_node),
+            state_parent.revision(),
+            delta,
+        );
+        history_count += 1;
+    }
+    Ok(history_count)
+}
+
+/// Sets the first-parent history of node `node_id` of `state` to the first-parent history `parent`
+/// holds for its node `parent_node`.
+async fn copy_first_parent_history(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    node_id: NodeID,
+    parent: &State,
+    parent_node: NodeID,
+) -> Result<(), CommitError> {
+    let metadata_node = node::node_to_file_metadata(parent_node);
+    let history = *parent
+        .block_file_metadata(
+            repository.clone(),
+            NodeFileMetadataBlock::index(metadata_node),
+        )
+        .await
+        .forward::<CommitError>("Failed deserializing parent file metadata block")?
+        .read()
+        .node(NodeFileMetadata::index(metadata_node));
+
+    let metadata_node = node::node_to_file_metadata(node_id);
+    let block_index = NodeFileMetadataBlock::index(metadata_node);
+    let block = state
+        .block_file_metadata(repository.clone(), block_index)
+        .await
+        .forward::<CommitError>("Failed deserializing file metadata block")?;
+    let dirtied = {
+        let mut block_writer = block.write();
+        let node = block_writer.node(NodeFileMetadata::index(metadata_node));
+        node.revision[0] = history.revision[0];
+        node.node[0] = history.node[0];
+        node.action[0] = history.action[0];
+        node.flags[0] = history.flags[0];
+        block_writer.mark_dirty()
+    };
+    if dirtied {
+        state.block_file_metadata_modified(block, block_index);
+        state.mark_dirty();
+    }
+    Ok(())
+}
+
+/// Records in the node at `node_index` of `block`, block `block_index` of `state`, that the node
+/// last changed in `parent_self` as `delta` describes, which names the node by its ID there, and
+/// clears its second-parent history.
+fn record_first_parent_change(
+    state: &State,
+    block: Arc<NodeFileMetadataBlock>,
+    block_index: usize,
+    node_index: usize,
+    parent_self: Hash,
+    delta: &NodeDelta,
+) {
+    let dirtied = {
+        let mut block_writer = block.write();
+        let node = block_writer.node(node_index);
+
+        node.revision[0] = parent_self;
+        node.revision[1] = Hash::default();
+        node.node[0] = delta.node;
+        node.node[1] = 0;
+        node.action[0] = delta.action;
+        node.flags[0] = delta.flags;
+        node.action[1] = change::FileAction::Keep as u16;
+        node.flags[1] = NodeFileMetadataFlags::NoFlag.bits();
+
+        lore_trace!("History of block {block_index} node {node_index}: {node:?}");
+
+        block_writer.mark_dirty()
+    };
+
+    if dirtied {
+        state.block_file_metadata_modified(block, block_index);
+        state.mark_dirty();
+    }
+}
+
+/// Finds the node of `to`, whose tree has `block_count` blocks, that is node `node_id` of `from`,
+/// for trees that do not share node IDs.
+///
+/// The node with the same ID is the counterpart when both are the same file, which keeps a file
+/// renamed since the two trees diverged. Any other node is [found at the path](node_at_path)
+/// `from` holds it at.
+async fn find_counterpart_node(
+    repository: &Arc<RepositoryContext>,
+    from: &State,
+    node_id: NodeID,
+    to: &State,
+    block_count: u32,
+) -> Result<Option<NodeID>, CommitError> {
+    if NodeBlock::index(node_id) < block_count as usize {
+        let from_node = from
+            .node(repository.clone(), node_id)
+            .await
+            .forward::<CommitError>("Failed reading node when weaving history")?;
+        let to_node = to
+            .node(repository.clone(), node_id)
+            .await
+            .forward::<CommitError>("Failed reading counterpart node when weaving history")?;
+        if from_node.is_file()
+            && to_node.is_file()
+            && !from_node.address.context.is_zero()
+            && from_node.address.context == to_node.address.context
+        {
+            return Ok(Some(node_id));
+        }
+    }
+
+    let path = from
+        .node_path(repository.clone(), node_id)
+        .await
+        .forward::<CommitError>("Failed constructing node path when weaving history")?;
+    node_at_path(repository, to, path.as_str())
+        .await
+        .forward::<CommitError>("Failed locating node when weaving history")
+}
+
+/// The node of `state` at `path`. `None` where `state` holds nothing at `path`, or holds it in a
+/// linked repository, whose history belongs to that repository's revisions.
+async fn node_at_path(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    path: &str,
+) -> Result<Option<NodeID>, state::StateError> {
+    let node_link = match state.find_node_link(repository.clone(), path).await {
+        Ok(node_link) => node_link,
+        Err(state::StateError::NodeNotFound(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !node_link.node.is_valid_node_id()
+        || node_link.repository != repository.id
+        || node_link.revision != state.revision()
+    {
+        return Ok(None);
+    }
+    Ok(Some(node_link.node))
+}
+
 pub async fn prepare_commit_metadata(
     repository: Arc<RepositoryContext>,
     metadata: Metadata,
@@ -3675,7 +4007,7 @@ pub async fn prepare_commit_metadata(
     if commit_user.is_empty() {
         // Authorship is required only when the active remote authenticates.
         let require_identity = match repository.remote().await {
-            Ok(conn) => !conn.auth_url.is_empty(),
+            Ok(conn) => !conn.auth_url().is_empty(),
             Err(lore_transport::ProtocolError::NoRemote(_)) => false,
             Err(_) => true,
         };
@@ -3767,25 +4099,89 @@ pub async fn prepare_commit_metadata(
 /// them. After pruning, the staged tracking is rebuilt against the new
 /// committed revision by re-running `file::dirty::dirty()` on the dirty paths
 /// captured beforehand (mirroring `state::rebase_staged_anchor`).
-pub(crate) async fn prune_dirty_for_commit(
-    state: Arc<State>,
-    repository: Arc<RepositoryContext>,
-) -> Result<(), CommitError> {
-    let _ = prune_dirty_recurse(state, repository, ROOT_NODE).await?;
-    Ok(())
-}
-
-/// Post-order walk: returns `true` when the caller should patch-discard this
-/// node from its parent's child chain. Post-order is required so empty
-/// intermediate directories can collapse upward after their dirty-add
-/// children have already been removed.
+///
+/// The walk is post-order, so empty intermediate directories can collapse
+/// upward after their dirty-add children have already been removed. It is a
+/// loop over a stack of the nodes entered and not yet left rather than a
+/// recursion, so no node is boxed and the thread's stack does not grow with the
+/// tree's depth.
 ///
 /// Only dirty children are descended into: `node_mark_dirty` propagates the
 /// base Dirty bit up to the root, so a clean child cannot have dirty
 /// descendants (the same invariant `collect_dirty_paths` walks by). Clean
 /// subtrees are untouched — in particular a clean committed empty directory
-/// is no longer visited, so the empty-directory collapse below only applies
-/// to directories on dirty paths.
+/// is no longer visited, so the empty-directory collapse only applies to
+/// directories on dirty paths.
+pub(crate) async fn prune_dirty_for_commit(
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
+) -> Result<(), CommitError> {
+    let root = state
+        .block(repository.clone(), NodeBlock::index(ROOT_NODE))
+        .await
+        .forward::<CommitError>("Failed deserializing state block")?;
+    let mut levels = vec![PruneLevel::new(ROOT_NODE, root)];
+    while let Some(child_id) = levels.last().map(|level| level.next_child) {
+        if child_id.is_valid_node_id() {
+            let child_block = state
+                .block(repository.clone(), NodeBlock::index(child_id))
+                .await
+                .forward::<CommitError>("Failed deserializing state block")?;
+            let (next_sibling, child_is_dirty) = {
+                let child = child_block.node(Node::index(child_id));
+                (child.sibling, child.is_dirty())
+            };
+            if let Some(level) = levels.last_mut() {
+                level.next_child = next_sibling;
+            }
+            if child_is_dirty {
+                levels.push(PruneLevel::new(child_id, child_block));
+            }
+            continue;
+        }
+
+        let Some(level) = levels.pop() else { break };
+        let node_id = level.node_id;
+        if prune_dirty_leave(&state, &repository, level).await?
+            && let Some(parent) = levels.last_mut()
+        {
+            parent.to_discard.push(node_id);
+        }
+    }
+    Ok(())
+}
+
+/// A dirty node [`prune_dirty_for_commit`] has entered and not yet left.
+struct PruneLevel {
+    node_id: NodeID,
+    block: Arc<NodeBlock>,
+    /// The next child to visit, invalid once every child has been, and from the start for a node
+    /// that is not a directory.
+    next_child: NodeID,
+    /// The children found to be patch-discarded, in the order visited.
+    to_discard: Vec<NodeID>,
+}
+
+impl PruneLevel {
+    fn new(node_id: NodeID, block: Arc<NodeBlock>) -> Self {
+        let node = block.node(Node::index(node_id));
+        let next_child = if node.is_directory() {
+            node.child
+        } else {
+            INVALID_NODE
+        };
+        Self {
+            node_id,
+            block,
+            next_child,
+            to_discard: Vec::new(),
+        }
+    }
+}
+
+/// Leaves a node of [`prune_dirty_for_commit`] once its children have been: patch-discards the
+/// children found to be discarded, clears its dirty flags unless it is an unstaged dirty add to be
+/// discarded, and returns `true` when its parent should patch-discard it from its child chain.
 ///
 /// `clear_dirty_flags` preserves Staged and the action bits when Staged is set,
 /// so clearing both restores dirty-only nodes and strips a stale Dirty
@@ -3793,91 +4189,92 @@ pub(crate) async fn prune_dirty_for_commit(
 /// parent. An intermediate directory created solely to host dirty-add children
 /// is discarded once emptied, so the parent's rehash does not pull in an
 /// orphaned dirty-only directory.
-fn prune_dirty_recurse(
-    state: Arc<State>,
-    repository: Arc<RepositoryContext>,
-    node_id: NodeID,
-) -> Pin<Box<dyn Future<Output = Result<bool, CommitError>> + Send>> {
-    Box::pin(async move {
-        let block_index = NodeBlock::index(node_id);
-        let node_index = Node::index(node_id);
-        let block = state
-            .block(repository.clone(), block_index)
+async fn prune_dirty_leave(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    level: PruneLevel,
+) -> Result<bool, CommitError> {
+    let PruneLevel {
+        node_id,
+        block,
+        to_discard,
+        ..
+    } = level;
+    for discard_id in to_discard {
+        state::node_discard_patch(state.clone(), repository.clone(), discard_id, |_, _| {})
             .await
-            .forward::<CommitError>("Failed deserializing state block")?;
+            .forward::<CommitError>("Failed patch-discarding dirty node")?;
+    }
 
-        let (is_directory, child_initial) = {
-            let node = block.node(node_index);
-            (node.is_directory(), node.child)
+    let node_index = Node::index(node_id);
+    let is_root = node_id == ROOT_NODE;
+    let (is_staged, is_dirty_add, is_dirty, is_dir_now, child_now, link) = {
+        let node = block.node(node_index);
+        (
+            node.is_staged(),
+            node.is_dirty_add(),
+            node.is_dirty(),
+            node.is_directory(),
+            node.child,
+            node.is_link().then(|| node.linked_node()),
+        )
+    };
+
+    if !is_staged && is_dirty_add && !is_root {
+        return Ok(true);
+    }
+
+    if is_dirty {
+        if let Some(link) = link.filter(|_| !is_staged) {
+            restore_committed_link_pin(state, repository, node_id, link).await?;
+        }
+        let dirtied = {
+            let mut block_writer = block.write();
+            let node = block_writer.node(node_index);
+            node.clear_dirty_flags();
+            block_writer.mark_dirty()
         };
-
-        if is_directory {
-            let mut child_id = child_initial;
-            let mut to_discard: Vec<NodeID> = Vec::new();
-            while child_id.is_valid_node_id() {
-                let child_block = state
-                    .block(repository.clone(), NodeBlock::index(child_id))
-                    .await
-                    .forward::<CommitError>("Failed deserializing state block")?;
-                let (next_sibling, child_is_dirty) = {
-                    let child = child_block.node(Node::index(child_id));
-                    (child.sibling, child.is_dirty())
-                };
-
-                if child_is_dirty
-                    && prune_dirty_recurse(state.clone(), repository.clone(), child_id).await?
-                {
-                    to_discard.push(child_id);
-                }
-
-                child_id = next_sibling;
-            }
-
-            for discard_id in to_discard {
-                state::node_discard_patch(state.clone(), repository.clone(), discard_id, |_, _| {})
-                    .await
-                    .forward::<CommitError>("Failed patch-discarding dirty node")?;
-            }
+        if dirtied {
+            state.block_modified(block.clone(), NodeBlock::index(node_id));
         }
+    }
 
-        let is_root = node_id == ROOT_NODE;
-        let (is_staged, is_dirty_add, is_dirty, is_dir_now, child_now) = {
-            let node = block.node(node_index);
-            (
-                node.is_staged(),
-                node.is_dirty_add(),
-                node.is_dirty(),
-                node.is_directory(),
-                node.child,
-            )
-        };
+    if is_staged {
+        return Ok(false);
+    }
 
-        if !is_staged && is_dirty_add && !is_root {
-            return Ok(true);
-        }
+    Ok(is_dir_now && !child_now.is_valid_node_id() && !is_root)
+}
 
-        if is_dirty {
-            let dirtied = {
-                let mut block_writer = block.write();
-                let node = block_writer.node(node_index);
-                node.clear_dirty_flags();
-                block_writer.mark_dirty()
-            };
-            if dirtied {
-                state.block_modified(block.clone(), block_index);
-            }
-        }
-
-        if is_staged {
-            return Ok(false);
-        }
-
-        if is_dir_now && !child_now.is_valid_node_id() && !is_root {
-            return Ok(true);
-        }
-
-        Ok(false)
-    })
+async fn restore_committed_link_pin(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+    link: NodeLink,
+) -> Result<(), CommitError> {
+    let (_, linked_state) = link
+        .open(repository)
+        .await
+        .forward::<CommitError>("Failed to deserialize dirty linked state")?;
+    let committed = linked_state.committed_revision();
+    if committed == link.revision {
+        return Ok(());
+    }
+    let branch = state
+        .link_find(repository.clone(), link.repository, node_id)
+        .await
+        .forward::<CommitError>("Failed to find link")?
+        .branch;
+    link::update_link_pin_by_node(
+        state,
+        repository.clone(),
+        link.repository,
+        branch,
+        committed,
+        node_id,
+    )
+    .await
+    .forward::<CommitError>("Failed to restore committed link pin")
 }
 
 /// Resolve which branch a revision built on `current_revision` publishes to.
@@ -3980,7 +4377,7 @@ async fn stamp_commit_metadata(
     let identity = execution_context().user_id().await;
     if identity.is_empty() {
         let require_identity = match repository.remote().await {
-            Ok(connection) => !connection.auth_url.is_empty(),
+            Ok(connection) => !connection.auth_url().is_empty(),
             Err(lore_transport::ProtocolError::NoRemote(_)) => false,
             Err(_) => true,
         };
@@ -4120,7 +4517,12 @@ pub async fn commit_in_memory_revision(
                 .forward::<CommitError>("Failed to write commit metadata")?,
         );
 
-        weave_history(work_repository.clone(), state_staged.clone()).await?;
+        weave_history(
+            work_repository.clone(),
+            state_staged.clone(),
+            BasedOn::FirstParent,
+        )
+        .await?;
 
         state_staged.reset_merge_conflict_flags();
         state_staged.clear_link_merge_state();
@@ -4295,7 +4697,11 @@ async fn freeze_in_memory_tree(
     generate_delta_block(repository, state, delta, tracker).await
 }
 
-/// Walk one directory's staged children, recursing into staged subdirectories.
+/// Walk the staged directories under `node_id`, depth first in child order, each directory's files
+/// before its subdirectories.
+///
+/// The walk is a loop over a stack of directories rather than a recursion, so no directory is
+/// boxed and the thread's stack does not grow with the tree's depth.
 ///
 /// Sequential on purpose: the walk only flips flags and appends to one shared
 /// delta buffer, so fanning out would contend on that buffer for no gain — the
@@ -4312,126 +4718,93 @@ async fn freeze_directory(
     subnodes_to_discard: Arc<parking_lot::RwLock<Vec<NodeID>>>,
     stats: Arc<CommitStats>,
 ) -> Result<(), CommitError> {
-    let parent = state
-        .node(repository.clone(), node_id)
-        .await
-        .forward::<CommitError>("Failed deserializing state block")?;
-    if parent.is_staged() {
-        delta_add(delta.clone(), node_id, parent.flags);
-    }
-
-    let mut subdirectories: Vec<NodeID> = Vec::new();
-    let mut updated = false;
-    let mut children =
-        StateNodeChildrenIterator::from_parent(state.clone(), repository.clone(), node_id, &parent)
+    let mut pending = vec![node_id];
+    while let Some(node_id) = pending.pop() {
+        let parent = state
+            .node(repository.clone(), node_id)
             .await
             .forward::<CommitError>("Failed deserializing state block")?;
-    while let Some((child_node_id, child_node)) = children
-        .next()
-        .await
-        .forward::<CommitError>("Failed deserializing state block")?
-    {
-        if !child_node.is_staged() {
-            continue;
-        }
-        updated = true;
-
-        // No working tree holds this one, so a conflict on any node has nowhere to be resolved and
-        // no markers to read.
-        if child_node.is_staged_merge_unresolved() {
-            let path = state
-                .node_path(repository.clone(), child_node_id)
-                .await
-                .unwrap_or_default();
-            reject_unresolved_conflict(&child_node, &path)?;
+        if parent.is_staged() {
+            delta_add(delta.clone(), node_id, parent.flags);
         }
 
-        if child_node.is_staged_delete() {
-            if child_node.is_directory() {
-                collect_discard_subnodes(
-                    repository.clone(),
-                    state.clone(),
-                    delta.clone(),
-                    child_node_id,
-                    subnodes_to_discard.clone(),
-                    stats.clone(),
-                )
-                .await?;
-            }
-            discard.write().push(child_node_id);
-            if child_node.is_file() {
-                stats.complete.file_total.fetch_add(1, Ordering::Relaxed);
-            } else {
-                stats
-                    .complete
-                    .directory_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            continue;
-        }
-
-        if child_node.is_directory() {
-            subdirectories.push(child_node_id);
-            continue;
-        }
-
-        delta_add(delta.clone(), child_node_id, child_node.flags);
-        freeze_node(repository.clone(), state.clone(), child_node_id).await?;
-        stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
-        stats.complete.file_total.fetch_add(1, Ordering::Relaxed);
-        stats
-            .complete
-            .file_modify_count
-            .fetch_add(1, Ordering::Relaxed);
-        stats.record_file_action(child_node.flags, child_node.size);
-        stats.discovery.total_files.fetch_add(1, Ordering::Relaxed);
-    }
-
-    for subdirectory in subdirectories {
-        freeze_directory_recurse(
-            repository.clone(),
+        let first_subdirectory = pending.len();
+        let mut updated = false;
+        let mut children = StateNodeChildrenIterator::from_parent(
             state.clone(),
-            subdirectory,
-            delta.clone(),
-            discard.clone(),
-            subnodes_to_discard.clone(),
-            stats.clone(),
+            repository.clone(),
+            node_id,
+            &parent,
         )
-        .await?;
-    }
+        .await
+        .forward::<CommitError>("Failed deserializing state block")?;
+        while let Some((child_node_id, child_node)) = children
+            .next()
+            .await
+            .forward::<CommitError>("Failed deserializing state block")?
+        {
+            if !child_node.is_staged() {
+                continue;
+            }
+            updated = true;
 
-    if updated {
-        stats
-            .complete
-            .directory_count
-            .fetch_add(1, Ordering::Relaxed);
-        stats
-            .complete
-            .directory_total
-            .fetch_add(1, Ordering::Relaxed);
+            // No working tree holds this one, so a conflict on any node has nowhere to be resolved and
+            // no markers to read.
+            if child_node.is_staged_merge_unresolved() {
+                let path = state
+                    .node_path(repository.clone(), child_node_id)
+                    .await
+                    .unwrap_or_default();
+                reject_unresolved_conflict(&child_node, &path)?;
+            }
+
+            if child_node.is_staged_delete() {
+                if child_node.is_directory() {
+                    collect_discard_subnodes(
+                        repository.clone(),
+                        state.clone(),
+                        delta.clone(),
+                        child_node_id,
+                        subnodes_to_discard.clone(),
+                        stats.clone(),
+                    )
+                    .await?;
+                }
+                discard.write().push(child_node_id);
+                if child_node.is_file() {
+                    stats.complete.file_total.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    stats
+                        .complete
+                        .directory_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
+
+            if child_node.is_directory() {
+                pending.push(child_node_id);
+                continue;
+            }
+
+            delta_add(delta.clone(), child_node_id, child_node.flags);
+            freeze_node(repository.clone(), state.clone(), child_node_id).await?;
+            stats.count_file();
+            stats
+                .complete
+                .file_modify_count
+                .fetch_add(1, Ordering::Relaxed);
+            stats.record_file_action(child_node.flags, child_node.size);
+            stats.discovery.total_files.fetch_add(1, Ordering::Relaxed);
+        }
+        pending[first_subdirectory..].reverse();
+
+        if updated {
+            stats.count_directory();
+        }
     }
 
     Ok(())
-}
-
-fn freeze_directory_recurse(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
-    node_id: NodeID,
-    delta: Arc<parking_lot::RwLock<BytesMut>>,
-    discard: Arc<parking_lot::RwLock<Vec<NodeID>>>,
-    subnodes_to_discard: Arc<parking_lot::RwLock<Vec<NodeID>>>,
-    stats: Arc<CommitStats>,
-) -> Pin<Box<dyn Future<Output = Result<(), CommitError>> + Send>> {
-    Box::pin(freeze_directory(
-        repository,
-        state,
-        node_id,
-        delta,
-        discard,
-        subnodes_to_discard,
-        stats,
-    ))
 }
 
 /// Clear the staged and dirty flags a committed node no longer carries.

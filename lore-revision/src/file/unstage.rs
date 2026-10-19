@@ -9,7 +9,6 @@ use std::sync::atomic::Ordering;
 use dashmap::DashMap;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::errors::*;
@@ -42,10 +41,9 @@ use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::path::resolve_user_paths;
-use crate::repository::DOT_LORE;
-use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
+use crate::repository::is_reserved_node_name;
 use crate::state;
 use crate::state::NodeMapping;
 use crate::state::State;
@@ -55,7 +53,7 @@ use crate::util::path::RelativePath;
 
 /// Data for the event emitted when an unstage operation begins.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileUnstageBeginEventData {
     /// Number of paths requested for unstaging.
@@ -64,7 +62,7 @@ pub struct LoreFileUnstageBeginEventData {
 
 /// Running counts of items processed during an unstage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileUnstageCountData {
     /// Number of directories that were unstaged.
@@ -81,7 +79,7 @@ pub struct LoreFileUnstageCountData {
 
 /// Data for the progress event emitted periodically during an unstage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileUnstageProgressEventData {
     /// Current counts of items processed.
@@ -90,7 +88,7 @@ pub struct LoreFileUnstageProgressEventData {
 
 /// Data for the event emitted when an unstage operation completes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileUnstageEndEventData {
     /// Final counts of items processed.
@@ -99,7 +97,7 @@ pub struct LoreFileUnstageEndEventData {
 
 /// Data for the event identifying the repository and revision involved in an unstage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileUnstageRevisionEventData {
     /// Identifier of the repository.
@@ -110,7 +108,7 @@ pub struct LoreFileUnstageRevisionEventData {
 
 /// Data for the event emitted for each file affected by an unstage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileUnstageFileEventData {
     /// Path of the file, relative to the root of the working tree.
@@ -917,7 +915,7 @@ async fn unstage_node(
         return Ok(());
     }
 
-    if name == DOT_URC || name == DOT_LORE {
+    if is_reserved_node_name(name) {
         lore_debug!("Ignore dot directory {name}");
         return Ok(());
     }
@@ -1398,9 +1396,13 @@ fn demote_subnodes_to_dirty<'a>(
                 .forward::<UnstageError>("Invalid node hierarchy in unstage walk")?;
             let next_child_sibling = child_node.sibling();
 
-            let child_name = child_block
-                .node_name_ref(child_node_index)
-                .forward::<UnstageError>("Failed to read node name")?;
+            let Some(child_name) = child_block
+                .node_name_ref_or_skip(child_node_index, child_node_id)
+                .forward::<UnstageError>("Failed to read node name")?
+            else {
+                child_node_iter = next_child_sibling;
+                continue;
+            };
             // Takes the name by value so its block read lock ends here, rather than reaching the
             // write below (see NodeNameLock docs).
             let child_path = relative_path.push_into_buf(child_name).freeze();

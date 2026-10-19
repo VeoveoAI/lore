@@ -39,8 +39,6 @@ use lore_storage::local::immutable_store::ImmutableStoreSettings;
 use lore_storage::local::immutable_store::create as create_immutable;
 use lore_storage::local::mutable_store::LocalMutableStore;
 use lore_storage::local::mutable_store::MutableStoreSettings;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
@@ -53,7 +51,7 @@ use crate::storage::store::StoreInternal;
 
 /// Remote endpoint configuration for a storage handle.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, ValidateText)]
+#[derive(Debug, Clone, PartialEq, Default, ValidateText, bitcode::Encode, bitcode::Decode)]
 pub struct LoreStorageRemoteConfig {
     /// gRPC endpoint of the peer storage service; authenticated with the open call's `globals.identity`
     pub remote_url: LoreString,
@@ -61,7 +59,7 @@ pub struct LoreStorageRemoteConfig {
 
 /// Arguments for `lore_storage_open`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(open_local)]
 pub struct LoreStorageOpenArgs {
     /// Path to an existing lore repository; must be empty when `in_memory` is set
@@ -72,14 +70,9 @@ pub struct LoreStorageOpenArgs {
     pub remote_config: LoreStorageRemoteConfig,
     /// Activate `remote_config`; otherwise the handle has no remote
     pub has_remote_config: u8,
-    /// Skip re-hashing a loaded payload and checking it against the address it was read from.
-    ///
-    /// Zero keeps the check, which is the default: a store handing back bytes under a content
-    /// address should be able to say they are the bytes that address names. A caller whose own
-    /// layer already assures integrity - one that scrubs its store on a schedule, say - pays for
-    /// the check on every byte of every read and learns nothing new from it, and can set this.
-    ///
-    /// Applies to every read on the handle.
+    /// Alias of `globals.trust_remote` for this handle: the handle trusts its remote when either is
+    /// set, so payloads fetched from it have only their sizes checked against their length and are
+    /// never hashed. Payloads the local store holds are never hashed either way.
     pub skip_verify: u8,
     /// Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
     /// incremental background GC for the handle; `0` then selects the default. Shared disk backends
@@ -297,7 +290,7 @@ fn open_local(
             mutable,
             remote,
             bound_flags,
-            args.skip_verify != 0,
+            args.skip_verify != 0 || execution_context().globals().trust_remote(),
         ));
         let handle = handle::register(store);
         LoreEvent::StorageOpened(LoreStorageOpenedEventData {
