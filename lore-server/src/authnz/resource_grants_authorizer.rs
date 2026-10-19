@@ -1,9 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::collections::BTreeMap;
-use std::collections::HashSet;
-
-use anyhow::bail;
 use async_trait::async_trait;
 use lore_base::types::RepositoryId;
 use tonic::Status;
@@ -13,22 +9,9 @@ use super::repository_authorizer::RepositoryAuthorizer;
 use super::repository_authorizer::VerifiedToken;
 use crate::auth::jwt::ResourceMatcher;
 use crate::auth::jwt::ResourcePermission;
-use crate::settings::AuthSettings;
 
-enum GrantSource {
-    Structured {
-        claim: String,
-        resource_id_claim: String,
-        permission_claim: String,
-    },
-    Roles {
-        claim: String,
-        grants: BTreeMap<String, ResourcePermission>,
-    },
-}
-
-/// Per-repository grants read from the token's resource claim or explicitly
-/// configured direct role mappings, with no network call.
+/// Tier 2 authorizer: per-repository grants read from the token's resource
+/// claim, with no network call.
 ///
 /// The dotted claim path named by `[server.auth].resource_claim` holds the
 /// resource entries. An entry matches a repository when its resource name
@@ -45,12 +28,13 @@ enum GrantSource {
 /// whose entry shape cannot be changed, such as Keycloak's UMA `permissions`
 /// entries carrying `rsname` and `scopes`.
 pub struct ResourceGrantsAuthorizer {
-    source: GrantSource,
+    resource_claim: String,
+    resource_id_claim: String,
+    permission_claim: String,
     matcher: ResourceMatcher,
 }
 
 impl ResourceGrantsAuthorizer {
-    /// Read the existing structured resource-claim format.
     pub fn new(
         resource_claim: String,
         resource_id_claim: String,
@@ -59,169 +43,41 @@ impl ResourceGrantsAuthorizer {
         resource_wildcard: String,
     ) -> Self {
         Self {
-            source: GrantSource::Structured {
-                claim: resource_claim,
-                resource_id_claim,
-                permission_claim: permission_claim.unwrap_or_else(|| "permission".to_string()),
-            },
+            resource_claim,
+            resource_id_claim,
+            permission_claim: permission_claim.unwrap_or_else(|| "permission".to_string()),
             matcher: ResourceMatcher::new(resource_id_template, resource_wildcard),
         }
     }
 
-    /// Compile configured role meanings into exact native resource grants, or retain
-    /// the structured resource-claim reader. No subject assignments are held here.
-    pub fn from_settings(auth: &AuthSettings) -> anyhow::Result<Self> {
-        let Some(roles) = &auth.direct_repository_roles else {
-            let Some(claim) = &auth.resource_claim else {
-                bail!(
-                    "in-token repository grants require resource_claim or direct_repository_roles"
-                );
-            };
-            return Ok(Self::new(
-                claim.clone(),
-                auth.resource_id_claim.clone(),
-                auth.permission_claim.clone(),
-                auth.resource_id_template.clone(),
-                auth.resource_wildcard.clone(),
-            ));
-        };
-        if auth.resource_claim.is_some() || auth.permission_claim.is_some() {
-            bail!(
-                "direct_repository_roles cannot be combined with resource_claim or permission_claim"
-            );
-        }
-        if auth.oidc.as_ref().is_some_and(|oidc| {
-            oidc.resource_template.is_some()
-                || oidc.scope_template.is_some()
-                || oidc.token_exchange_issuer.is_some()
-        }) {
-            bail!(
-                "direct_repository_roles uses the original access token and cannot configure token exchange"
-            );
-        }
-        if roles
-            .claim
-            .split('.')
-            .any(|part| part.is_empty() || part.chars().any(char::is_whitespace))
-        {
-            bail!("direct_repository_roles.claim must be a nonempty dotted claim path");
-        }
-        if roles.grants.is_empty() {
-            bail!("direct_repository_roles.grants must not be empty");
-        }
-        let template = &auth.resource_id_template;
-        let remaining = template.replacen("{id}", "", 1);
-        if template.matches("{id}").count() != 1 || remaining.contains(['{', '}']) {
-            bail!(
-                "direct_repository_roles requires a resource_id_template containing exactly one {{id}} and no other expressions"
-            );
-        }
-        let matcher = ResourceMatcher::new(template.clone(), auth.resource_wildcard.clone());
-        let mut grants = BTreeMap::new();
-        for grant in &roles.grants {
-            if grant.role.is_empty() || grant.role.trim() != grant.role {
-                bail!(
-                    "direct_repository_roles role values must be nonempty and have no surrounding whitespace"
-                );
-            }
-            if grant.repository == RepositoryId::default() {
-                bail!("direct_repository_roles cannot name the root partition");
-            }
-            let resource_id = matcher.resource_for(grant.repository);
-            if resource_id == auth.resource_wildcard {
-                bail!("a direct repository grant cannot equal resource_wildcard");
-            }
-            let mut actions = HashSet::new();
-            for action in &grant.permissions {
-                if !actions.insert(action) {
-                    bail!("direct_repository_roles permissions must be distinct native actions");
-                }
-            }
-            if grants
-                .insert(
-                    grant.role.clone(),
-                    ResourcePermission {
-                        resource_id,
-                        permission: grant
-                            .permissions
-                            .iter()
-                            .map(|action| action.as_str().to_owned())
-                            .collect(),
-                    },
-                )
-                .is_some()
-            {
-                bail!("direct_repository_roles role values must be unique");
-            }
-        }
-        Ok(Self {
-            source: GrantSource::Roles {
-                claim: roles.claim.clone(),
-                grants,
-            },
-            matcher,
-        })
-    }
-
     /// The token's grant entries.
     fn grants(&self, token: &VerifiedToken<'_>) -> Vec<ResourcePermission> {
-        match &self.source {
-            GrantSource::Structured {
-                claim,
-                resource_id_claim,
-                permission_claim,
-            } => {
-                let Some(serde_json::Value::Array(entries)) = token.claims.claim_at(claim) else {
-                    return Vec::new();
-                };
-                entries
-                    .iter()
-                    .filter_map(|entry| {
-                        let resource_id = value_at(entry, resource_id_claim)?.as_str()?.to_owned();
-                        let permission = match value_at(entry, permission_claim) {
-                            Some(serde_json::Value::Array(values)) => values
-                                .iter()
-                                .filter_map(serde_json::Value::as_str)
-                                .map(ToString::to_string)
-                                .collect(),
-                            _ => Vec::new(),
-                        };
-                        Some(ResourcePermission {
-                            resource_id,
-                            permission,
-                        })
-                    })
-                    .collect()
-            }
-            GrantSource::Roles { claim, grants } => {
-                let Some(serde_json::Value::Array(roles)) = token.claims.claim_at(claim) else {
-                    return Vec::new();
-                };
-                // A malformed role cannot leave a partially authorized claim behind.
-                if roles.iter().any(|role| {
-                    role.as_str()
-                        .is_none_or(|value| value.is_empty() || value.trim() != value)
-                }) {
-                    return Vec::new();
-                }
-                roles
-                    .iter()
-                    .filter_map(|role| role.as_str().and_then(|role| grants.get(role)))
-                    .cloned()
-                    .collect()
-            }
-        }
+        let Some(serde_json::Value::Array(entries)) = token.claims.claim_at(&self.resource_claim)
+        else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .filter_map(|entry| self.grant_entry(entry))
+            .collect()
     }
 
-    /// Filter an already-local identifier list with the same current-token grant
-    /// source and matcher as partition admission, decoding the claim only once.
-    pub(crate) fn retain_authorized_repositories(
-        &self,
-        token: &VerifiedToken<'_>,
-        repositories: &mut Vec<RepositoryId>,
-    ) {
-        let grants = self.grants(token);
-        repositories.retain(|repository| self.matcher.any_match(&grants, *repository));
+    fn grant_entry(&self, entry: &serde_json::Value) -> Option<ResourcePermission> {
+        let resource_id = value_at(entry, &self.resource_id_claim)?
+            .as_str()?
+            .to_string();
+        let permission = match value_at(entry, &self.permission_claim) {
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .collect(),
+            _ => Vec::new(),
+        };
+        Some(ResourcePermission {
+            resource_id,
+            permission,
+        })
     }
 }
 

@@ -3,7 +3,6 @@
 
 mod auth;
 mod common;
-mod direct_repository_roles;
 mod global_grants_authorizer;
 mod rebac;
 mod repository_authorizer;

@@ -473,8 +473,6 @@ pub enum AuthorizerSelection {
     GlobalGrants,
     /// OIDC Tier 2: verify per-repository grants from the resource claim.
     ResourceGrants,
-    /// Exact grants mapped from signed roles, using the original access token.
-    DirectRepositoryRoles,
 }
 
 impl fmt::Display for AuthorizerSelection {
@@ -484,15 +482,13 @@ impl fmt::Display for AuthorizerSelection {
             Self::AuthClient => "AuthClientAuthorizer",
             Self::GlobalGrants => "GlobalGrantsAuthorizer",
             Self::ResourceGrants => "ResourceGrantsAuthorizer",
-            Self::DirectRepositoryRoles => "ResourceGrantsAuthorizer(direct roles)",
         })
     }
 }
 
-/// Select the configured native authorizer:
+/// The four-way selection:
 /// - neither `[server.auth]` nor `auth_url` → allow-all
 /// - `auth_url` set → the gRPC online auth check
-/// - `direct_repository_roles` set → exact grants from signed roles
 /// - `resource_claim` set → `ResourceGrants`
 /// - otherwise → `GlobalGrants`
 pub fn select_repository_authorizer(
@@ -509,13 +505,6 @@ pub fn select_repository_authorizer(
             ),
         };
     };
-    if auth.direct_repository_roles.is_some() {
-        if auth_url.is_some() {
-            bail!("direct_repository_roles cannot be combined with auth_url");
-        }
-        ResourceGrantsAuthorizer::from_settings(auth)?;
-        return Ok(AuthorizerSelection::DirectRepositoryRoles);
-    }
     match (auth_url, auth.resource_claim.as_deref()) {
         (Some(_), Some(_)) => bail!(
             "[environment.endpoint] auth_url and [server.auth] resource_claim are both set: \
@@ -546,9 +535,17 @@ pub fn repository_authorizer(
             let auth = auth.expect("GlobalGrants is only selected under [server.auth]");
             Arc::new(GlobalGrantsAuthorizer::new(auth.permission_claim.clone()))
         }
-        AuthorizerSelection::ResourceGrants | AuthorizerSelection::DirectRepositoryRoles => {
+        AuthorizerSelection::ResourceGrants => {
             let auth = auth.expect("ResourceGrants is only selected under [server.auth]");
-            Arc::new(ResourceGrantsAuthorizer::from_settings(auth)?)
+            Arc::new(ResourceGrantsAuthorizer::new(
+                auth.resource_claim
+                    .clone()
+                    .expect("ResourceGrants is only selected with resource_claim set"),
+                auth.resource_id_claim.clone(),
+                auth.permission_claim.clone(),
+                auth.resource_id_template.clone(),
+                auth.resource_wildcard.clone(),
+            ))
         }
     })
 }

@@ -211,31 +211,3 @@ async fn an_issuer_the_document_does_not_vouch_for_is_not_advertised() {
         "{error:?}"
     );
 }
-
-#[tokio::test]
-async fn direct_roles_advertise_original_access_tokens_without_exchange_metadata() {
-    let base = spawn_provider(None).await;
-    let auth = auth_settings(
-        &base,
-        Some(
-            r#"
-        client_id = "public-cli"
-        scopes = ["openid", "lore-api/access_as_user"]
-        [direct_repository_roles]
-        claim = "roles"
-        [[direct_repository_roles.grants]]
-        role = "repository.member"
-        repository = "0194b726b34e72b0b45550b88a967076"
-        permissions = []
-    "#,
-        ),
-    );
-    lore_server::authnz::repository_authorizer::select_repository_authorizer(Some(&auth), None)
-        .unwrap();
-    let oidc = advertised_oidc(&auth, None).await.unwrap().unwrap();
-    assert_eq!(oidc.client_id, "public-cli");
-    assert_eq!(oidc.issuer, base);
-    assert_eq!(oidc.resource_template, None);
-    assert_eq!(oidc.scope_template, None);
-    assert_eq!(oidc.token_exchange_issuer, None);
-}

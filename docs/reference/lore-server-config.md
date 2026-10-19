@@ -405,12 +405,11 @@ When `[server.auth]` is present, `jwt_issuer` and `jwt_audience` are both mandat
 | `oidc` | none | The optional `[server.auth.oidc]` sub-table below, which configures the OIDC provider info shown to clients. |
 | `permission_claim` | none | Dotted path of the JWT claim carrying the caller's allowed actions, e.g. `realm_access.roles` (Keycloak) or `groups` (Dex). When using `GlobalGrantsAuthorizer` (Tier 1), this JWT claim defines where the user's global permissions are read from. When `resource_claim` is set and `ResourceGrantsAuthorizer` (Tier 2) is in use, it instead names the field inside each resource entry holding the per-partition actions, defaulting to `permission`. |
 | `resource_claim` | none | Dotted path of the JWT claim carrying per-repository resource grants. If this is set, enables the granular `ResourceGrantsAuthorizer` (Tier 2) authorizer. |
-| `direct_repository_roles` | none | Opt-in exact repository grants from a signed flat role claim. Uses the original API access token; see the direct-role configuration below. Mutually exclusive with `resource_claim`, `permission_claim`, `auth_url` and token-exchange settings. |
 | `resource_id_claim` | `resource_id` | The field inside each resource entry that names the resource, for providers whose entry shape cannot be changed. Keycloak's UMA `authorization.permissions` entries carry the resource name in `rsname`, for example: set `resource_claim = "authorization.permissions"`, `resource_id_claim = "rsname"` and `permission_claim = "scopes"` to read them. Tier 2 only. |
 | `resource_id_template` | `urc-{id}` | Template that renders a repository id into the corresponding resource name. `{id}` is replaced by the repository id. When verifying permissions with `ResourceGrantsAuthorizer` (Tier 2), uses this string to search for the matching resource entry in the JWT. |
 | `resource_wildcard` | `urc-*` | The resource name that matches every repository. |
 | `baseline_access` | `denied` | What the `baseline` repository catalog answers to `lore repository list`: `denied` (the default) lists none, `reachable` lists every partition ID the server holds. Gates listing of the IDs only, never grants access to the contents. `denied` blocks no operation on a partition the caller holds a grant for. Not consulted by the `auth_service` catalog. A server with no `[server.auth]` lists everything it holds. |
-| `repository_catalog` | derived | Which catalog answers `lore repository list`: `auth_service` fetches the list from `UrcAuthApi` gRPC service's `LookupUserPermissions`. `baseline` fetches the list from the server's own store, based on `baseline_access` configuration rule. `token_grants` filters actual local repository IDs through the same current-token grants as partition admission, then uses native identifier pagination; it requires structured resource grants or direct role mappings. When unset, uses `auth_service` if `[environment.endpoint] auth_url` is set, and `baseline` otherwise. Set this to `auth_service` to keep an auth-service catalog on a deployment authorizing from token claims, or set it to `baseline` to list from the server store on a `UrcAuthApi` deployment. |
+| `repository_catalog` | derived | Which catalog answers `lore repository list`: `auth_service` fetches the list from `UrcAuthApi` gRPC service's `LookupUserPermissions`. `baseline` fetches the list from the server's own store, based on `baseline_access` configuration rule. When unset, uses `auth_service` if `[environment.endpoint] auth_url` is set, and `baseline` otherwise. Set this to `auth_service` to keep an auth-service catalog on a deployment authorizing from token claims, or set it to `baseline` to list from the server store on a `UrcAuthApi` deployment. |
 | `repository_catalog_url` | `auth_url` | The `UrcAuthApi` endpoint the `auth_service` catalog asks. Defaults to `[environment.endpoint] auth_url`. This is required with `repository_catalog = "auth_service"` when `auth_url` is unset. The catalog forwards the caller's own token, so the endpoint must accept the tokens this server verifies. |
 
 The caller's identity, recorded as the creator of what the caller makes and compared wherever an identity is checked, is read from the token: its `identity` claim, or the namespaced alias `https://lore.org/claims/identity`, where the issuer mints one, and `sub` otherwise. No setting names it.
@@ -444,57 +443,6 @@ When this table is present, the environment service advertises an OIDC provider 
 | `scope_template` | none | Template string for mapping a partition to a scope value, for example `partition:{id}`. For OIDC providers that use scope for token exchange, not `resource`. Tier 2. |
 
 `ResourceGrantsAuthorizer` (Tier 2, `resource_claim` set) requires one of `resource_template` and `scope_template`. The templates are mutually exclusive.
-
-
-`[server.auth.direct_repository_roles]` selects exact repository grants from a signed string-array
-claim. This is a separate opt-in input to the same native resource-grants authorizer, not a global
-role authorizer. The original API access token carries all assigned roles and is sent unchanged;
-no repository exchange template or exchange issuer may be configured. Identity-provider role
-assignments remain authoritative. This server configuration defines what a role means, not who
-holds it.
-
-```toml
-[server.auth]
-jwt_issuer = "https://accounts.example.com"
-jwt_audience = ["lore-api"]
-jwt_typ = "JWT" # Match this API's actual access-token profile.
-resource_id_template = "urc-{id}"
-repository_catalog = "token_grants"
-
-[server.auth.direct_repository_roles]
-claim = "roles"
-
-[[server.auth.direct_repository_roles.grants]]
-role = "ProjectExample.Member"
-repository = "0194b726b34e72b0b45550b88a967076"
-permissions = []
-
-[server.auth.oidc]
-client_id = "separate-public-cli-client"
-scopes = ["openid", "lore-api/access_as_user"]
-preferred = true
-```
-
-Each literal role maps to one non-root native repository ID and zero or more existing privileged
-actions: `owner`, `admin`, `migrate` or `obliterate`. Empty actions grant ordinary repository access,
-including unprotected writes; they are not read-only. Mapped actions do not set `is_service_account`
-or bypass protected-branch, creator or hook checks. Multiple assigned roles union their native
-actions for the same exact repository. Unknown roles grant nothing. An absent, non-array or malformed
-role claim grants nothing, including when a malformed entry accompanies a known role.
-
-Construction rejects empty or duplicate roles/actions, unsupported actions, invalid/root repository
-IDs, and ambiguous mappings. `resource_id_template` must contain exactly one `{id}` and no other
-expressions. A generated resource name cannot equal `resource_wildcard`. No mapping grants wildcard
-repository access. With `repository_catalog = "token_grants"`, only authorized repositories that
-currently exist locally are listed; a continuation is filtered against the current token again.
-
-Signature, issuer, audience, token type, expiry and the client's signed recipient-domain checks are
-unchanged. Use distinct API and public-client registrations so an ID token cannot satisfy the API
-audience. The issuer must sign an existing supported `root_domains` claim (string or string array),
-or a usable audience host, for the actual Lore endpoint. Do not substitute an ID token or a client
-configuration value for that claim. A refreshed token must preserve the native issuer, client,
-identity and recipient bindings. Removing a role does not immediately invalidate an already-issued
-self-contained token or strengthen existing long-lived session revocation semantics.
 
 ```toml
 [server.auth]

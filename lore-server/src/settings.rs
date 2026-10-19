@@ -6,7 +6,6 @@ use std::env;
 use config::Config;
 use lore_base::runtime::TokioSettings;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
-use lore_base::types::RepositoryId;
 use lore_base::version::LORE_LIBRARY_VERSION;
 use lore_revision::branch::CachedRevisionItem;
 use lore_revision::branch::CachedRevisionListHeader;
@@ -245,9 +244,7 @@ fn validate_oidc_config(
     let error = |message: &str| Err(config::ConfigError::Message(message.to_string()));
     let Some(oidc) = auth.oidc.as_ref() else {
         return match selection {
-            AuthorizerSelection::GlobalGrants
-            | AuthorizerSelection::ResourceGrants
-            | AuthorizerSelection::DirectRepositoryRoles => error(
+            AuthorizerSelection::GlobalGrants | AuthorizerSelection::ResourceGrants => error(
                 "[server.auth] without [environment.endpoint] auth_url authorizes OIDC tokens, \
                  so clients need [server.auth.oidc] to log in.",
             ),
@@ -393,9 +390,6 @@ pub struct AuthSettings {
     /// Dotted path of the claim carrying per-repository resource grants.
     /// If this is set, enables the granular `ResourceGrantsAuthorizer`.
     pub resource_claim: Option<String>,
-    /// Direct, exact repository grants mapped from an issuer's flat role claim.
-    /// Mutually exclusive with resource claims, an auth service and token exchange.
-    pub direct_repository_roles: Option<DirectRepositoryRoles>,
     /// The field inside each resource entry naming the resource, for
     /// providers whose entry shape cannot be changed (Keycloak's UMA
     /// `permissions` entries carry `rsname`, for example).
@@ -421,49 +415,6 @@ pub struct AuthSettings {
     pub repository_catalog_url: Option<String>,
     /// OIDC provider settings advertised for clients.
     pub oidc: Option<OidcSettings>,
-}
-
-/// Installation-defined role meanings. Assignments remain in the identity provider.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DirectRepositoryRoles {
-    /// Dotted path of a string-array claim in the verified access token.
-    pub claim: String,
-    /// Each literal role names exactly one repository and its native actions.
-    pub grants: Vec<RepositoryRoleGrant>,
-}
-
-/// The native repository grant conveyed by one exact signed role value.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RepositoryRoleGrant {
-    pub role: String,
-    pub repository: RepositoryId,
-    /// Empty grants ordinary repository access, including unprotected writes.
-    pub permissions: Vec<RepositoryAction>,
-}
-
-/// Named privileged actions currently implemented by the native authorizer.
-/// Ordinary repository access is represented by an empty action set.
-#[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum RepositoryAction {
-    Owner,
-    Admin,
-    Migrate,
-    Obliterate,
-}
-
-impl RepositoryAction {
-    /// The existing native permission name, without introducing role semantics.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Owner => "owner",
-            Self::Admin => "admin",
-            Self::Migrate => "migrate",
-            Self::Obliterate => "obliterate",
-        }
-    }
 }
 
 /// What the environment service advertises about the OIDC provider,
@@ -525,8 +476,6 @@ pub enum BaselineAccess {
 pub enum RepositoryCatalogMode {
     /// Answer per `baseline_access` from the server's own store.
     Baseline,
-    /// Filter local repositories through the configured in-token resource grants.
-    TokenGrants,
     /// Ask a `UrcAuthApi` service's `LookupUserPermissions`, forwarding the
     /// caller's token.
     AuthService,

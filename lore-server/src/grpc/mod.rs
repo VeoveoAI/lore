@@ -343,19 +343,6 @@ pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool
 }
 
 pub fn user_permissions(extensions: &Extensions, repository: RepositoryId) -> Vec<String> {
-    if let Some(grants) = extensions.get::<crate::authnz::repository_authorizer::PartitionGrants>()
-    {
-        if grants.repository_id != repository {
-            return Vec::new();
-        }
-        use crate::authnz::repository_authorizer::Grants;
-        match &grants.grants {
-            Grants::Actions(actions) => return actions.iter().cloned().collect(),
-            Grants::Denied => return Vec::new(),
-            // Preserve the fallback for authorizers without a finite action set.
-            Grants::All => {}
-        }
-    }
     let user_resources = resources_from_token(get_authorization(extensions).ok());
     ResourceMatcher::default().merged_permissions(&user_resources, repository)
 }

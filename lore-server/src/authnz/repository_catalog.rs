@@ -26,20 +26,19 @@ use tracing::warn;
 
 use super::auth::grpc_get_auth_client;
 use super::common::create_request_with_authorization;
-use super::repository_authorizer::AuthorizerSelection;
 use super::repository_authorizer::VerifiedToken;
 use super::repository_authorizer::bearer_header;
 use super::repository_authorizer::select_repository_authorizer;
-use super::resource_grants_authorizer::ResourceGrantsAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::settings::AuthSettings;
 use crate::settings::BaselineAccess;
 use crate::settings::RepositoryCatalogMode;
 
-/// Which partitions a caller may see. Enumeration searches the external grant
-/// store or filters local identifiers through explicit token grants.
-/// This is not a standard OIDC feature and lives off the authorization path.
+/// Which partitions a caller may see. Enumeration needs to do a search over the
+/// grant store. The information is not available in the tokens, and this is not
+/// a standard OIDC feature. Therefore this functionality lives off the
+/// authorization path on this optional trait.
 #[async_trait]
 pub trait RepositoryCatalog: Send + Sync {
     /// The partitions `token` may see, paginated. Returns a list of repository IDs,
@@ -153,31 +152,6 @@ impl RepositoryCatalog for BaselineRepositoryCatalog {
             BaselineAccess::Denied => Ok((Vec::new(), None)),
             BaselineAccess::Reachable => page(self.list_held().await?, page_size, page_token),
         }
-    }
-}
-
-/// Enumerates only local repositories the current verified token authorizes,
-/// through the same grant reader and matcher as partition admission.
-struct TokenGrantsRepositoryCatalog {
-    local: BaselineRepositoryCatalog,
-    authorizer: ResourceGrantsAuthorizer,
-}
-
-#[async_trait]
-impl RepositoryCatalog for TokenGrantsRepositoryCatalog {
-    async fn list_repositories(
-        &self,
-        token: Option<&VerifiedToken<'_>>,
-        page_size: Option<u32>,
-        page_token: Option<&str>,
-    ) -> Result<(Vec<RepositoryId>, Option<String>), Status> {
-        let Some(token) = token else {
-            return Err(Status::unauthenticated("No token"));
-        };
-        let mut held = self.local.list_held().await?;
-        self.authorizer
-            .retain_authorized_repositories(token, &mut held);
-        page(held, page_size, page_token)
     }
 }
 
@@ -301,8 +275,6 @@ pub enum CatalogSelection {
     /// `LookupUserPermissions` at this `UrcAuthApi` endpoint, forwarding the
     /// caller's token.
     AuthClient(String),
-    /// Local identifiers filtered through the current token's repository grants.
-    TokenGrants,
 }
 
 impl fmt::Display for CatalogSelection {
@@ -315,7 +287,6 @@ impl fmt::Display for CatalogSelection {
                 f.write_str("BaselineRepositoryCatalog(reachable)")
             }
             Self::AuthClient(url) => write!(f, "AuthClientRepositoryCatalog({url})"),
-            Self::TokenGrants => f.write_str("TokenGrantsRepositoryCatalog"),
         }
     }
 }
@@ -331,7 +302,7 @@ pub fn select_repository_catalog(
     auth: Option<&AuthSettings>,
     auth_url: Option<&str>,
 ) -> anyhow::Result<CatalogSelection> {
-    let authorizer = select_repository_authorizer(auth, auth_url)?;
+    select_repository_authorizer(auth, auth_url)?;
     let Some(auth) = auth else {
         return Ok(CatalogSelection::Baseline(BaselineAccess::Reachable));
     };
@@ -342,17 +313,6 @@ pub fn select_repository_catalog(
     });
     Ok(match mode {
         RepositoryCatalogMode::Baseline => CatalogSelection::Baseline(auth.baseline_access),
-        RepositoryCatalogMode::TokenGrants => {
-            if !matches!(
-                authorizer,
-                AuthorizerSelection::ResourceGrants | AuthorizerSelection::DirectRepositoryRoles
-            ) {
-                return Err(anyhow!(
-                    "token_grants catalog requires in-token repository grants"
-                ));
-            }
-            CatalogSelection::TokenGrants
-        }
         RepositoryCatalogMode::AuthService => {
             let url = auth
                 .repository_catalog_url
@@ -390,17 +350,6 @@ pub fn repository_catalog(
                 warn!("[server.auth] baseline_access is not consulted by the auth_service catalog");
             }
             Arc::new(AuthClientRepositoryCatalog::new(url))
-        }
-        CatalogSelection::TokenGrants => {
-            let auth = auth.ok_or_else(|| anyhow!("token_grants requires server.auth"))?;
-            Arc::new(TokenGrantsRepositoryCatalog {
-                local: BaselineRepositoryCatalog::new(
-                    BaselineAccess::Reachable,
-                    immutable_store,
-                    mutable_store,
-                ),
-                authorizer: ResourceGrantsAuthorizer::from_settings(auth)?,
-            })
         }
     })
 }
