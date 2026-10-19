@@ -5,6 +5,13 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ## Nightly
 
+- Native Lore server can opt into `direct_repository_roles`: exact signed role values map to typed
+  repository IDs and existing native actions, with no repository token exchange or new issuer.
+  Unknown roles grant nothing; malformed role arrays cannot partially authorize. The opt-in
+  `token_grants` catalog lists actual local repositories through the same grants and pagination.
+  Structured resource-claim exchange remains unchanged. Empty actions retain ordinary native
+  repository access, including unprotected writes. JWT and token-recipient checks remain unchanged.
+
 ### Breaking changes
 
 - A client and the Lore service it relays commands to must come from the same build. Commands, their events and their
