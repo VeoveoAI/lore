@@ -18,6 +18,7 @@ members = [
     "lore-proto",
     "lore-revision",
     "lore-server",
+    "lore-s3-postgres",
     "lore-storage",
     "lore-telemetry",
     "lore-transport",
@@ -112,6 +113,7 @@ lore-notification = { path = "lore-notification" }
 lore-proto = { path = "lore-proto" }
 lore-revision = { path = "lore-revision" }
 lore-server = { path = "lore-server" }
+lore-s3-postgres = { path = "lore-s3-postgres" }
 lore-storage = { path = "lore-storage" }
 lore-telemetry = { path = "lore-telemetry" }
 lore-transport = { path = "lore-transport" }

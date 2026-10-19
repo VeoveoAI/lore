@@ -892,6 +892,19 @@ impl StreamHandlerFactory for QuicInternalStreamHandler {
     }
 }
 
+/// Open the selected native stores for operator tooling while the owning server is stopped.
+/// This does not start a listener or change authentication/authorization configuration.
+pub async fn open_operator_stores(
+    settings: &Settings,
+) -> Result<(Arc<dyn ImmutableStore>, Arc<dyn MutableStore>)> {
+    let mut registry = PluginRegistry::new();
+    plugins::register_all_plugins(&mut registry);
+    let immutable = configure_immutable_store_via_plugin(&registry, settings, None).await?;
+    let mutable =
+        configure_mutable_store_via_plugin(&registry, settings, immutable.clone()).await?;
+    Ok((immutable, mutable))
+}
+
 async fn configure_immutable_store_via_plugin(
     registry: &PluginRegistry,
     settings: &Settings,

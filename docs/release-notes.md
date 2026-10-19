@@ -48,6 +48,13 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- Add the `s3_postgres` native storage plugin: S3-compatible immutable payloads and
+  PostgreSQL partition associations, lifecycle state and mutable references in an
+  operator-provided schema. The immutable and mutable stores share a bounded pool;
+  local resource locks remain scoped to one server. See
+  [the backend contract](../../lore-s3-postgres/README.md) for publication,
+  interruption, orphan-retention and explicit qualification limits
+
 - `--trust-remote` (C API: `trust_remote` on `lore_global_args_t`) declares the remote a trusted source, for a machine
   within the remote's own infrastructure where performance comes first, such as a build server streaming from a server
   in its own backend. A payload fetched from a trusted remote has only its sizes checked against its length, is never

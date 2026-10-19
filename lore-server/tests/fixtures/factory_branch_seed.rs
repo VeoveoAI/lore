@@ -1,21 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Operator-only disposable test fixture. Back up and stop the owning server before opening its stores.
+//! Operator-only disposable test fixture. Stop the owning server before opening its stores.
 //! Uses ordinary repository/branch functions; it is not part of the server or hook runtime.
-use lore_base::{
-    runtime::{LORE_CONTEXT, runtime},
-    types::Context,
-};
-use lore_revision::{branch, repository::RepositoryContext};
-use lore_server::{
-    grpc::{
-        forwarded_requests::CallerContext, get_write_token,
-        repository::v1::repository_create::repository_create_implementation,
-    },
-    hooks::HookDispatcher,
-};
-use lore_storage::local::immutable_store::{ImmutableStoreCreateOptions, ImmutableStoreSettings};
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use lore_base::runtime::LORE_CONTEXT;
+use lore_base::runtime::runtime;
+use lore_base::types::Context;
+use lore_revision::branch;
+use lore_revision::repository::RepositoryContext;
+use lore_server::grpc::forwarded_requests::CallerContext;
+use lore_server::grpc::get_write_token;
+use lore_server::grpc::repository::v1::repository_create::repository_create_implementation;
+use lore_server::hooks::HookDispatcher;
 
 struct Instruments;
 impl lore_telemetry::InstrumentProvider for Instruments {
@@ -25,15 +23,17 @@ impl lore_telemetry::InstrumentProvider for Instruments {
 }
 
 fn main() -> anyhow::Result<()> {
-    let root = PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .ok_or_else(|| anyhow::anyhow!("data root required; server must be stopped"))?,
+    let config_path = PathBuf::from(std::env::args().nth(1).ok_or_else(|| {
+        anyhow::anyhow!("native server config directory required; server must be stopped")
+    })?);
+    anyhow::ensure!(
+        config_path.join("local.toml").is_file(),
+        "native server config directory must contain local.toml"
     );
+    let (settings, _) = lore_server::settings::Settings::load(config_path.to_str(), Some("local"))?;
     lore_storage::assume_server_policies();
     runtime().block_on(LORE_CONTEXT.scope(lore_server::util::setup_execution("factory_branch_fixture", String::new(), "fixture-operator".into()), async move {
-        let immutable = lore_storage::local::immutable_store::create(Some(root.clone()), ImmutableStoreCreateOptions::none(), true, ImmutableStoreSettings { isolate_partitions: true, implicit_durable_stored: true, protect_local_fragment: false, flush_background: false, initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, ..Default::default() }).await?;
-        let mutable: Arc<dyn lore_storage::MutableStore> = lore_storage::local::mutable_store::create(Some(root), lore_storage::MutableStoreSettings { authoritative: true, initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, ..Default::default() }, immutable.clone()).await?;
+        let (immutable, mutable) = lore_server::server::open_operator_stores(&settings).await?;
         let repository = Context::from(uuid::Uuid::now_v7());
         let forbidden = Context::from(uuid::Uuid::now_v7());
         let main = Context::from(uuid::Uuid::now_v7());

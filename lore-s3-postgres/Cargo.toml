@@ -1,0 +1,34 @@
+[package]
+name = "lore-s3-postgres"
+edition = "2024"
+version.workspace = true
+publish = false
+
+[lib]
+test = false
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+blake3 = { workspace = true }
+futures = { workspace = true }
+lore-aws = { workspace = true }
+lore-base = { workspace = true }
+lore-error-set = { workspace = true }
+lore-storage = { workspace = true }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+tokio = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[features]
+integration-tests = []
+test-util = []
+
+[dev-dependencies]
+lore-base = { workspace = true, features = ["test-util"] }
+lore-s3-postgres = { workspace = true, features = ["test-util"] }
+rand = { workspace = true }
+zerocopy = { workspace = true }
+
+[lints]
+workspace = true
