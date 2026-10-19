@@ -71,6 +71,9 @@ pub struct IdentityToken {
     /// lifecycle: consumed on use and replaced atomically.
     #[serde(default)]
     refresh_token: Option<String>,
+    /// Public client that obtained this refresh grant. An unbound grant is not renewed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_client_id: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -455,12 +458,54 @@ fn keyring_entry(target: &str) -> Result<Arc<keyring::Entry>, TokenStoreError> {
     Ok(entry)
 }
 
+/// Updates a stored access token, retaining its existing refresh material.
 pub async fn store_user_token(
     auth_endpoint: &str,
     identity: &str,
     token: &str,
-    mut acceptable_root_domains: Vec<String>,
+    acceptable_root_domains: Vec<String>,
 ) -> Result<(), TokenStoreError> {
+    store_user_grant_inner(
+        auth_endpoint,
+        identity,
+        token,
+        acceptable_root_domains,
+        (None, None),
+        true,
+    )
+    .await
+}
+
+/// Replaces the access and refresh credentials of one login under the store lock.
+/// A login without a refresh token clears the previous login's refresh grant.
+pub async fn store_user_grant(
+    auth_endpoint: &str,
+    identity: &str,
+    token: &str,
+    acceptable_root_domains: Vec<String>,
+    refresh_token: Option<&str>,
+    refresh_client_id: Option<&str>,
+) -> Result<(), TokenStoreError> {
+    store_user_grant_inner(
+        auth_endpoint,
+        identity,
+        token,
+        acceptable_root_domains,
+        (refresh_token, refresh_client_id),
+        false,
+    )
+    .await
+}
+
+async fn store_user_grant_inner(
+    auth_endpoint: &str,
+    identity: &str,
+    token: &str,
+    mut acceptable_root_domains: Vec<String>,
+    refresh_grant: (Option<&str>, Option<&str>),
+    preserve_existing_refresh: bool,
+) -> Result<(), TokenStoreError> {
+    let (refresh_token, refresh_client_id) = refresh_grant;
     let auth_endpoint = auth_endpoint.trim_end_matches('/');
 
     // If we got the token from this endpoint it stands to reason we can
@@ -471,6 +516,10 @@ pub async fn store_user_token(
     acceptable_root_domains.push(auth_domain);
 
     let encrypted_token = encrypt_token(token).await?;
+    let encrypted_refresh = match refresh_token {
+        Some(token) => Some(encrypt_token(token).await?),
+        None => None,
+    };
 
     lore_trace!(
         "Store user {identity} token for auth endpoint {auth_endpoint} and audiences '{acceptable_root_domains:?}'"
@@ -480,7 +529,8 @@ pub async fn store_user_token(
         user_id: identity.to_string(),
         token: encrypted_token,
         acceptable_root_domains,
-        refresh_token: None,
+        refresh_token: encrypted_refresh,
+        refresh_client_id: refresh_token.and(refresh_client_id).map(str::to_owned),
     };
 
     let mut map_lock = cached_token_map().await;
@@ -497,11 +547,13 @@ pub async fn store_user_token(
                 .iter()
                 .position(|entry| entry.user_id == identity_token.user_id)
             {
-                // Preserve existing refresh token when updating the auth token
-                let existing_refresh = remote.token[existing_index].refresh_token.take();
-                let mut new_token = identity_token;
-                new_token.refresh_token = existing_refresh;
-                remote.token[existing_index] = new_token;
+                let mut replacement = identity_token;
+                if preserve_existing_refresh {
+                    replacement.refresh_token = remote.token[existing_index].refresh_token.take();
+                    replacement.refresh_client_id =
+                        remote.token[existing_index].refresh_client_id.take();
+                }
+                remote.token[existing_index] = replacement;
                 lore_trace!(
                     "Replace user {identity} token for auth_endpoint {auth_endpoint} in existing entry"
                 );
@@ -538,6 +590,113 @@ pub async fn store_user_token(
     } else {
         lore_debug!("Unexpected, no token map to store to file");
         Err(TokenStoreError::internal("Failed to store token map"))
+    }
+}
+
+/// An authoritative stored grant held under the existing process and file locks.
+/// Holding it through a bounded refresh request prevents another process consuming the same grant.
+/// These locks give cooperating processes coherent pairs, not crash-atomic file replacement.
+/// It deliberately does not implement `Debug`, since its credentials are plaintext.
+pub struct LockedUserToken {
+    map: MappedMutexGuard<'static, Option<TokenMap>>,
+    guard: FSLock,
+    key: Vec<u8>,
+    remote: usize,
+    identity: usize,
+    token: String,
+    refresh_token: Option<String>,
+}
+
+/// Reloads and locks a stored grant; a failed disk read never falls back to cached refresh material.
+pub async fn lock_user_token<P>(
+    auth_endpoint: &str,
+    identity: &str,
+    mut filter: P,
+) -> Result<LockedUserToken, TokenStoreError>
+where
+    P: FnMut(&&IdentityToken) -> bool,
+{
+    let key = get_token_encryption_key().await?;
+    let mut map = cached_token_map().await;
+    let guard = lock_token_map().await?;
+    let loaded = load_token_map(&guard)?;
+    let remote = loaded
+        .remotes
+        .iter()
+        .position(|remote| remote.remote == auth_endpoint.trim_end_matches('/'))
+        .ok_or(TokenNotFound)?;
+    let identity = loaded.remotes[remote]
+        .token
+        .iter()
+        .position(|entry| entry.user_id == identity && filter(&entry))
+        .ok_or(TokenNotFound)?;
+    let entry = &loaded.remotes[remote].token[identity];
+    let token = open_token(&key, &entry.token)?;
+    let refresh_token = entry
+        .refresh_token
+        .as_ref()
+        .map(|token| open_token(&key, token))
+        .transpose()?;
+    *map = Some(loaded);
+    Ok(LockedUserToken {
+        map,
+        guard,
+        key,
+        remote,
+        identity,
+        token,
+        refresh_token,
+    })
+}
+
+impl LockedUserToken {
+    /// The latest access token read from disk under the lock.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// The current refresh credential, still protected by the lock.
+    pub fn refresh_token(&self) -> Option<&str> {
+        self.refresh_token.as_deref()
+    }
+
+    /// The public client that obtained the current refresh grant.
+    pub fn refresh_client_id(&self) -> Option<&str> {
+        self.map.as_ref()?.remotes[self.remote].token[self.identity]
+            .refresh_client_id
+            .as_deref()
+    }
+
+    /// Commits a refresh response as one pair. An omitted replacement retains the current refresh.
+    pub fn replace(
+        mut self,
+        token: &str,
+        mut acceptable_root_domains: Vec<String>,
+        refresh_token: Option<&str>,
+    ) -> Result<(), TokenStoreError> {
+        let mut updated = self.map.as_ref().ok_or(TokenNotFound)?.clone();
+        let remote = &mut updated.remotes[self.remote];
+        acceptable_root_domains.push(get_domain_or_empty(&remote.remote));
+        let entry = &mut remote.token[self.identity];
+        entry.token = seal_token(&self.key, token)?;
+        entry.acceptable_root_domains = acceptable_root_domains;
+        if let Some(refresh) = refresh_token {
+            entry.refresh_token = Some(seal_token(&self.key, refresh)?);
+        }
+        store_token_map(&self.guard, &updated)?;
+        *self.map = Some(updated);
+        Ok(())
+    }
+
+    /// Discards a refresh grant the provider has definitively refused, retaining its access token.
+    pub fn clear_refresh(mut self) -> Result<(), TokenStoreError> {
+        let mut updated = self.map.as_ref().ok_or(TokenNotFound)?.clone();
+        let entry = &mut updated.remotes[self.remote].token[self.identity];
+        entry.refresh_token = None;
+        entry.refresh_client_id = None;
+        store_token_map(&self.guard, &updated)?;
+        *self.map = Some(updated);
+        Ok(())
     }
 }
 
@@ -847,8 +1006,8 @@ pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenSt
 
 /// Encrypts and stores (or replaces) the refresh token for an identity.
 ///
-/// Called by orchestration after login or successful refresh. Overwrites
-/// any existing refresh token atomically.
+/// This stores an unbound credential. Login uses [`store_user_grant`] and renewal uses
+/// [`LockedUserToken::replace`] so access, refresh and public-client binding change together.
 pub async fn store_refresh_token(
     auth_endpoint: &str,
     identity: &str,
@@ -875,6 +1034,7 @@ pub async fn store_refresh_token(
             .find(|entry| entry.user_id == identity)
     {
         token_entry.refresh_token = Some(encrypted_refresh);
+        token_entry.refresh_client_id = None;
     } else {
         lore_debug!(
             "No identity entry found for {identity} at {auth_endpoint}, cannot store refresh token"
@@ -1262,6 +1422,7 @@ pub mod test_util {
                 token: token.into(),
                 acceptable_root_domains,
                 refresh_token,
+                refresh_client_id: None,
             }
         }
 

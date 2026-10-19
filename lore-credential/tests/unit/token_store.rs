@@ -6,8 +6,8 @@ use lore_credential::IdentityToken;
 use lore_credential::token_store::RemoteIdentity;
 use lore_credential::token_store::TokenMap;
 use lore_credential::token_store::load_user_token;
-use lore_credential::token_store::load_user_token_from_store;
-use lore_credential::token_store::remove_user_token_if;
+use lore_credential::token_store::lock_user_token;
+use lore_credential::token_store::store_user_grant;
 use lore_credential::token_store::store_user_token;
 use lore_credential::token_store::test_util::encryption_key_from_stored;
 use lore_credential::token_store::test_util::generate_encryption_key;
@@ -16,12 +16,76 @@ use lore_credential::token_store::test_util::open_token;
 use lore_credential::token_store::test_util::seal_token;
 use lore_credential::token_store::test_util::single_nonce_sequence;
 use lore_credential::token_store::test_util::split_remote_resource;
-use lore_credential::token_store::test_util::store_file;
 use lore_credential::token_store::tokens_only_for_recipient_domain;
 use lore_credential::token_store::vulnerable_all_tokens;
 use ring::aead::AES_256_GCM;
 use ring::aead::NONCE_LEN;
 use ring::aead::NonceSequence;
+
+#[tokio::test]
+async fn a_new_login_replaces_one_grant_and_cannot_inherit_an_old_refresh() {
+    const ENDPOINT: &str = "https://auth.login-replacement.test.invalid";
+    store_user_grant(
+        ENDPOINT,
+        "alice",
+        "access-1",
+        vec!["one.test.invalid".into()],
+        Some("refresh-1"),
+        Some("client-1"),
+    )
+    .await
+    .unwrap();
+    store_user_token(
+        ENDPOINT,
+        "alice",
+        "updated-access-1",
+        vec!["one.test.invalid".into()],
+    )
+    .await
+    .unwrap();
+    {
+        let stored = lock_user_token(ENDPOINT, "alice", vulnerable_all_tokens())
+            .await
+            .unwrap();
+        assert_eq!(stored.token(), "updated-access-1");
+        assert_eq!(stored.refresh_token(), Some("refresh-1"));
+        assert_eq!(stored.refresh_client_id(), Some("client-1"));
+    }
+    store_user_grant(
+        ENDPOINT,
+        "alice",
+        "access-2",
+        vec!["two.test.invalid".into()],
+        Some("refresh-2"),
+        Some("client-2"),
+    )
+    .await
+    .unwrap();
+    {
+        let stored = lock_user_token(ENDPOINT, "alice", vulnerable_all_tokens())
+            .await
+            .unwrap();
+        assert_eq!(stored.token(), "access-2");
+        assert_eq!(stored.refresh_token(), Some("refresh-2"));
+        assert_eq!(stored.refresh_client_id(), Some("client-2"));
+    }
+    store_user_grant(
+        ENDPOINT,
+        "alice",
+        "access-3",
+        vec!["three.test.invalid".into()],
+        None,
+        Some("client-3"),
+    )
+    .await
+    .unwrap();
+    let stored = lock_user_token(ENDPOINT, "alice", vulnerable_all_tokens())
+        .await
+        .unwrap();
+    assert_eq!(stored.token(), "access-3");
+    assert_eq!(stored.refresh_token(), None);
+    assert_eq!(stored.refresh_client_id(), None);
+}
 
 #[test]
 fn refresh_token_serde_default_none() {
@@ -268,34 +332,4 @@ async fn no_supplied_token_reads_the_store() {
     )
     .await;
     assert!(result.is_err());
-}
-
-/// A token removed only where it is a given one is compared with the store as its file holds it,
-/// so a token another process stored in its place after this process cached the store is left
-/// alone, and the given one is removed. The test stands in for the other process by writing the
-/// store's file back as it was before this process stored the given token.
-#[tokio::test]
-async fn a_conditional_removal_leaves_a_token_another_process_stored() {
-    const ENDPOINT: &str = "https://auth.conditional-removal.test.invalid/repository";
-    let file = store_file().expect("the token store's file");
-    store_user_token(ENDPOINT, "alice", "newer", Vec::new())
-        .await
-        .expect("store the newer token");
-    let newer = std::fs::read(&file).expect("read the store holding the newer token");
-    store_user_token(ENDPOINT, "alice", "refused", Vec::new())
-        .await
-        .expect("store the refused token");
-    std::fs::write(&file, newer).expect("store the newer token from another process");
-
-    remove_user_token_if(ENDPOINT, "alice", "refused")
-        .await
-        .expect("remove the refused token");
-    let kept = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
-    assert_eq!(kept.ok().as_deref(), Some("newer"));
-
-    remove_user_token_if(ENDPOINT, "alice", "newer")
-        .await
-        .expect("remove the newer token");
-    let removed = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
-    assert!(removed.is_err(), "the given token was left in the store");
 }

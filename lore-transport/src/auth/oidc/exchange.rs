@@ -13,7 +13,6 @@ use lore_credential::get_domain_or_empty;
 use lore_credential::insecure_decode_token;
 use serde::Deserialize;
 
-use super::body_excerpt;
 use super::discovery;
 use super::token;
 use super::token::Outcome;
@@ -207,16 +206,14 @@ fn authorization_token(response: ExchangeResponse) -> Result<AuthorizationToken,
         && issued != ACCESS_TOKEN_TYPE
         && issued != JWT_TOKEN_TYPE
     {
-        return Err(ProtocolError::internal(format!(
-            "OIDC token exchange issued a token of type '{}'; an access token was requested",
-            body_excerpt(&issued)
-        )));
+        return Err(ProtocolError::internal(
+            "OIDC token exchange issued an unsupported token; an access token was requested",
+        ));
     }
     if !token_type.eq_ignore_ascii_case("bearer") {
-        return Err(ProtocolError::internal(format!(
-            "OIDC token exchange issued a token of type '{}'; only Bearer is supported",
-            body_excerpt(&token_type)
-        )));
+        return Err(ProtocolError::internal(
+            "OIDC token exchange issued an unsupported token type; only Bearer is supported",
+        ));
     }
     let Ok(decoded) = insecure_decode_token(&access_token) else {
         return Err(ProtocolError::internal(
