@@ -10,8 +10,14 @@ publish = false
 # targets. Set this back to build a harness for unit tests.
 test = false
 
+[features]
+default = ["native-conversions"]
+# Native in-process callers retain the existing model conversion impls. Wire-only
+# consumers can use the generated API without linking the native runtime.
+native-conversions = ["dep:lore-base"]
+
 [dependencies]
-lore-base = { workspace = true }
+lore-base = { workspace = true, optional = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 tonic = { workspace = true }

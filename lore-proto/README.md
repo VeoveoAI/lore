@@ -5,6 +5,12 @@
 This crate contains the proto files and the build code to generate and expose a crate, using `prost` and `tonic`.
 It also contains a package.json so the proto files can be published to artifactory.
 
+The default `native-conversions` feature preserves conversions between generated
+messages and `lore-base` models for native callers. Wire-only clients can set
+`default-features = false` to use the same generated clients/messages without
+linking `lore-base`, its runtime dependencies or its process-wide allocator.
+This feature does not change the protocol or generated API.
+
 ## Publish
 In order to publish do the following:
 

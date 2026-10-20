@@ -25,6 +25,7 @@ pub mod rpc;
 #[path = "grpc/ucs.auth.rs"]
 pub mod rebac;
 
+#[cfg(feature = "native-conversions")]
 mod convert;
 
 pub use lock::lock_service_client::LockServiceClient;
