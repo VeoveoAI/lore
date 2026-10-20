@@ -391,6 +391,11 @@ pub trait Environment: Send + Sync {
 /// resolving user identities.
 #[async_trait]
 pub trait Authentication: Send + Sync {
+    /// The public client a stored refresh grant belongs to, if this backend supports refresh.
+    fn refresh_client_id(&self) -> Option<&str> {
+        None
+    }
+
     /// Starts an interactive authentication session.
     async fn start_auth_session(
         &self,

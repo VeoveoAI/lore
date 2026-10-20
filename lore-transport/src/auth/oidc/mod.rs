@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lore_base::error::Disconnected;
+use lore_base::error::NotAuthenticated;
 use lore_base::error::NotSupported;
 use lore_base::lore_spawn_net;
 use lore_base::lore_warn;
@@ -143,12 +144,6 @@ async fn on_net_runtime<T: Send + 'static>(
 struct FormResponse {
     status: http::StatusCode,
     body: Vec<u8>,
-}
-
-impl FormResponse {
-    fn body_text(&self) -> String {
-        body_excerpt(&String::from_utf8_lossy(&self.body))
-    }
 }
 
 /// POSTs `form` to `url` as `application/x-www-form-urlencoded` (RFC 6749 §4.1.3) and
@@ -282,6 +277,10 @@ impl From<discovery::DiscoveryError> for ProtocolError {
 
 #[async_trait]
 impl Authentication for OidcAuthentication {
+    fn refresh_client_id(&self) -> Option<&str> {
+        Some(&self.oidc.client_id)
+    }
+
     async fn start_auth_session(
         &self,
         auth_url: &str,
@@ -316,10 +315,42 @@ impl Authentication for OidcAuthentication {
     async fn refresh_authentication(
         &self,
         auth_url: &str,
-        _refresh_token: &str,
+        refresh_token: &str,
         _correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError> {
-        Err(Self::not_implemented("token refresh", auth_url))
+        let document = self.discover(auth_url).await?;
+        if refresh_token.is_empty() || self.oidc.client_id.is_empty() {
+            return Err(NotAuthenticated.into());
+        }
+        let form = vec![
+            ("grant_type", "refresh_token".to_owned()),
+            ("refresh_token", refresh_token.to_owned()),
+            ("client_id", self.oidc.client_id.clone()),
+        ];
+        match token::request("token refresh", &document.token_endpoint, form).await? {
+            token::Outcome::Token(response) => {
+                let token = token::authentication_token(response)?;
+                let claims = lore_credential::insecure_decode_token(&token.token)
+                    .map_err(|_invalid_token| ProtocolError::from(NotAuthenticated))?
+                    .claims;
+                if claims.issuer != self.oidc.issuer
+                    || [claims.azp.as_deref(), claims.client_id.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|client| client != self.oidc.client_id)
+                    || token.refresh_token.as_deref() == Some("")
+                {
+                    return Err(NotAuthenticated.into());
+                }
+                Ok(token)
+            }
+            token::Outcome::Refused(refusal) if refusal.error == "invalid_grant" => {
+                Err(NotAuthenticated.into())
+            }
+            token::Outcome::Refused(_) => {
+                Err(ProtocolError::internal("OIDC token refresh was refused"))
+            }
+        }
     }
 
     async fn exchange_for_repository(
