@@ -54,6 +54,14 @@ impl NotificationService {
     }
 }
 
+/// The status that ends a subscription whose subscriber fell `missed` events
+/// behind.
+fn lagged_status(missed: u64) -> Status {
+    Status::aborted(format!(
+        "notification subscriber fell {missed} events behind; subscribe again"
+    ))
+}
+
 type SubscribeResponseStream =
     Pin<Box<dyn Stream<Item = Result<lore_proto::lore::notification::Event, Status>> + Send>>;
 
@@ -100,11 +108,20 @@ impl lore_notification::NotificationService for NotificationService {
             "User subscribed to notifications"
         );
 
-        let stream = BroadcastStream::new(rx).filter_map(|res| {
+        // A subscriber that falls behind has missed events. Its stream ends
+        // with an error instead of skipping them, so the subscriber knows to
+        // subscribe again and catch up from the repository itself.
+        let mut lagged = false;
+        let stream = BroadcastStream::new(rx).map_while(move |res| {
+            if lagged {
+                return None;
+            }
             match res {
                 Ok(item) => Some(Ok(item)),
-                // Ignore if client is lagging behind, just drop the event
-                Err(BroadcastStreamRecvError::Lagged(_)) => None,
+                Err(BroadcastStreamRecvError::Lagged(missed)) => {
+                    lagged = true;
+                    Some(Err(lagged_status(missed)))
+                }
             }
         });
 

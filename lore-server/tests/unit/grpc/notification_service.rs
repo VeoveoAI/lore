@@ -142,3 +142,51 @@ async fn subscribe_stays_open_under_the_allow_all_authorizer() {
         .await
         .expect("a no-auth server's subscribe is open");
 }
+
+/// A subscriber that falls behind is told so and its stream ends, instead of
+/// silently missing events.
+#[tokio::test]
+async fn a_lagging_subscriber_stream_ends_with_aborted() {
+    use lore_revision::lore::BranchId;
+    use lore_revision::notification::NotificationSender as _;
+    use tokio_stream::StreamExt as _;
+
+    let sender = Arc::new(lore_server::notification::local::NotificationSender::default());
+    let service = NotificationService::new(
+        sender.clone(),
+        Arc::new(AllowAllRepositoryAuthorizer),
+        Duration::from_secs(5),
+    );
+    let subscribed = repository(1);
+    let request = Request::new(SubscribeRequest {
+        repository: Context::from(subscribed).into(),
+    });
+    let mut stream = service
+        .subscribe(request)
+        .await
+        .expect("a no-auth server's subscribe is open")
+        .into_inner();
+
+    // Far more events than the channel holds, sent before the subscriber reads.
+    for _ in 0..1000 {
+        sender
+            .branch_created(subscribed, BranchId::from(uuid::Uuid::now_v7()))
+            .await;
+    }
+
+    let status = match stream.next().await {
+        Some(Err(status)) => status,
+        Some(Ok(_)) => panic!("a lagging subscriber must not receive events past the gap"),
+        None => panic!("a lagging subscriber's stream must report the gap"),
+    };
+    assert_eq!(status.code(), Code::Aborted);
+    assert!(
+        status.message().contains("fell") && status.message().ends_with("subscribe again"),
+        "unexpected message: {}",
+        status.message()
+    );
+    assert!(
+        stream.next().await.is_none(),
+        "the stream ends after the gap"
+    );
+}
