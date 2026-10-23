@@ -226,10 +226,12 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * `--offline` — Force offline mode
 * `--remote` — Use remote data
 * `--local` — Use local data
-* `--identity <IDENTITY>` — Use given identity
+* `--identity <IDENTITY>` — Use given identity. `LORE_IDENTITY` supplies it when the flag is absent, unless
+  --identity-token names one
 * `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity
   the token was issued to
-* `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service
+* `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service.
+  Opaque tokens require --identity. `LORE_ACCESS_TOKEN` supplies it when the flag is absent
 * `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10)
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened

@@ -77,7 +77,8 @@ pub struct LoreCli {
     #[clap(global = true, long, action, conflicts_with = "remote")]
     pub local: bool,
 
-    /// Use given identity
+    /// Use given identity. `LORE_IDENTITY` supplies it when the flag is absent,
+    /// unless --identity-token names one
     #[clap(global = true, long, action)]
     pub identity: Option<String>,
 
@@ -88,6 +89,7 @@ pub struct LoreCli {
 
     /// Use given authorization token instead of exchanging one with the
     /// authentication service. Opaque tokens require --identity.
+    /// `LORE_ACCESS_TOKEN` supplies it when the flag is absent
     #[clap(global = true, long, value_name = "token")]
     pub access_token: Option<String>,
 
@@ -394,6 +396,8 @@ pub enum LoreCliError {
     ParseLogLevel(String),
     #[error("Auth mode '{0}' in {AUTH_MODE_VAR} is not valid. Choose one of [auto, grpc, oidc].")]
     ParseAuthMode(String),
+    #[error("{0} is not valid Unicode.")]
+    NotUnicode(&'static str),
 }
 
 /// The authentication path, as the `--auth-mode` flag names it.
@@ -440,6 +444,30 @@ pub fn resolve_auth_mode(
     Ok(AuthMode::Auto)
 }
 
+pub const ACCESS_TOKEN_VAR: &str = "LORE_ACCESS_TOKEN";
+pub const IDENTITY_VAR: &str = "LORE_IDENTITY";
+
+/// The value of a credential flag, or of `variable`, read as `from_env`, when the
+/// flag is absent. An empty flag or a blank variable counts as absent, so the
+/// variable stands in only for a flag that was not given.
+pub fn resolve_credential(
+    from_flag: Option<&str>,
+    from_env: Option<OsString>,
+    variable: &'static str,
+) -> Result<Option<String>, LoreCliError> {
+    if let Some(from_flag) = from_flag.filter(|value| !value.is_empty()) {
+        return Ok(Some(from_flag.to_string()));
+    }
+    let Some(from_env) = from_env else {
+        return Ok(None);
+    };
+    // The error is the variable's value, a credential, so it is not carried on.
+    let from_env = from_env
+        .into_string()
+        .map_err(|_credential| LoreCliError::NotUnicode(variable))?;
+    Ok((!from_env.trim().is_empty()).then_some(from_env))
+}
+
 pub fn lore_globals_from_args(cli: &LoreCli) -> Result<LoreGlobalArgs, LoreCliError> {
     let mut args = LoreGlobalArgs {
         repository_path: get_repository_path(cli.repository.clone()),
@@ -454,9 +482,13 @@ pub fn lore_globals_from_args(cli: &LoreCli) -> Result<LoreGlobalArgs, LoreCliEr
         cache: cli.cache.into(),
         trust_remote: cli.trust_remote.into(),
 
-        identity: cli.identity.clone().into(),
         identity_token: cli.identity_token.clone().into(),
-        access_token: cli.access_token.clone().into(),
+        access_token: resolve_credential(
+            cli.access_token.as_deref(),
+            std::env::var_os(ACCESS_TOKEN_VAR),
+            ACCESS_TOKEN_VAR,
+        )?
+        .into(),
 
         search_limit: cli.search_limit.unwrap_or_default() as u32,
         search_nearest: cli.search_nearest.into(),
@@ -496,6 +528,17 @@ pub fn lore_globals_from_args(cli: &LoreCli) -> Result<LoreGlobalArgs, LoreCliEr
     };
 
     args.auth_mode = resolve_auth_mode(cli.auth_mode, std::env::var_os(AUTH_MODE_VAR))?;
+
+    // An identity token names the identity it acts as, which the parser keeps
+    // --identity from contradicting; the variable does not contradict it either.
+    if cli.identity_token.as_deref().is_none_or(str::is_empty) {
+        args.identity = resolve_credential(
+            cli.identity.as_deref(),
+            std::env::var_os(IDENTITY_VAR),
+            IDENTITY_VAR,
+        )?
+        .into();
+    }
 
     Ok(args)
 }

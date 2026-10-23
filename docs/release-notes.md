@@ -48,6 +48,12 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `LORE_ACCESS_TOKEN` and `LORE_IDENTITY` supply `--access-token` and `--identity` when those flags are absent, as
+  `LORE_AUTH_MODE` does for `--auth-mode`. A flag outranks its variable and an empty value counts as absent.
+  `LORE_IDENTITY` does not apply beside `--identity-token`, which names its own identity, and an opaque token from the
+  environment still requires an identity. A process whose environment holds a placeholder that a trusted transport
+  resolves, such as a sandbox's provider credential, then runs plain `lore` commands with it
+
 - Add the `s3_postgres` native storage plugin: S3-compatible immutable payloads and
   PostgreSQL partition associations, lifecycle state and mutable references in an
   operator-provided schema. The immutable and mutable stores share a bounded pool;
