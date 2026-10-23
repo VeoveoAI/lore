@@ -6,13 +6,18 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use lore_base::types::Context;
-use lore_revision::lore::{BranchId, RepositoryId};
+use lore_revision::lore::BranchId;
+use lore_revision::lore::RepositoryId;
 use serde::Deserialize;
 
-use super::{
-    Hook, HookContext, HookError, HookFactory, HookPoint, HookRegistrationContext, HookRegistry,
-    StatusCode,
-};
+use super::Hook;
+use super::HookContext;
+use super::HookError;
+use super::HookFactory;
+use super::HookPoint;
+use super::HookRegistrationContext;
+use super::HookRegistry;
+use super::StatusCode;
 
 const NAME: &str = "factory_branch";
 
@@ -58,8 +63,7 @@ impl Hook for FactoryBranchHook {
         }
         let attempted = ctx
             .branch()
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "<missing>".into());
+            .map_or_else(|| "<missing>".into(), |id| id.to_string());
         let mut message = format!(
             "This factory is assigned to branch {branch}; attempted push to branch {attempted}."
         );
@@ -102,7 +106,7 @@ impl HookFactory for FactoryBranchHookFactory {
                 ));
             }
             let id = Context::from_str(id)
-                .map_err(|_| HookError::config_error(NAME, "Invalid assignment ID"))?;
+                .map_err(|_error| HookError::config_error(NAME, "Invalid assignment ID"))?;
             if id == Context::default() {
                 return Err(HookError::config_error(
                     NAME,

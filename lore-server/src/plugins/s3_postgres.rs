@@ -1,6 +1,6 @@
 // Copyright 2026 VeoveoAI
 // SPDX-License-Identifier: MIT
-//! S3 payloads and PostgreSQL associations/references in an existing database.
+//! S3 payloads and `PostgreSQL` associations/references in an existing database.
 use std::any::Any;
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use crate::plugins::PluginRegistry;
 
 const NAME: &str = "s3_postgres";
 
-/// Nonsecret storage configuration. PostgreSQL credentials come only from the selected
+/// Nonsecret storage configuration. `PostgreSQL` credentials come only from the selected
 /// environment variable or private file; S3 uses the native AWS credential provider chain.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,7 +49,7 @@ fn parse(config: &toml::Value) -> Result<S3PostgresConfig, PluginError> {
     let value: S3PostgresConfig = config
         .clone()
         .try_into()
-        .map_err(|_| config_error("Invalid s3_postgres configuration"))?;
+        .map_err(|_error| config_error("Invalid s3_postgres configuration"))?;
     if value.postgres_url_env.is_some() == value.postgres_url_file.is_some()
         || !lore_s3_postgres::database_schema_valid(&value.schema)
     {
@@ -67,7 +67,7 @@ fn parse(config: &toml::Value) -> Result<S3PostgresConfig, PluginError> {
 pub async fn open_store(config: &toml::Value) -> Result<Arc<S3PostgresStore>, PluginError> {
     let config = parse(config)?;
     let url = if let Some(name) = config.postgres_url_env {
-        std::env::var(name).map_err(|_| {
+        std::env::var(name).map_err(|_error| {
             config_error("PostgreSQL connection environment variable is unavailable")
         })?
     } else {
@@ -76,7 +76,7 @@ pub async fn open_store(config: &toml::Value) -> Result<Arc<S3PostgresStore>, Pl
             .ok_or_else(|| config_error("PostgreSQL connection file is unavailable"))?;
         tokio::fs::read_to_string(path)
             .await
-            .map_err(|_| config_error("PostgreSQL connection file is unreadable"))?
+            .map_err(|_error| config_error("PostgreSQL connection file is unreadable"))?
     };
     let database = Database::connect(url.trim(), &config.schema)
         .await
@@ -86,22 +86,24 @@ pub async fn open_store(config: &toml::Value) -> Result<Arc<S3PostgresStore>, Pl
                 message: error.to_string(),
             })
         })?;
-    let s3 = AwsClientBuilder::builder()
-        .with_http_settings(&HttpClientSettings::default())
-        .maybe_endpoint(config.s3_endpoint_url)
-        .maybe_region(config.s3_region)
-        .build_config()
-        .await
-        .s3_with_path_style(config.s3_force_path_style)
-        .ensure_bucket(&config.s3_bucket)
-        .build()
-        .await
-        .map_err(|_| {
-            PluginError::from(PluginInitError {
-                plugin_name: NAME.into(),
-                message: "Cannot open the configured S3 bucket".into(),
-            })
-        })?;
+    let s3 = Box::pin(
+        AwsClientBuilder::builder()
+            .with_http_settings(&HttpClientSettings::default())
+            .maybe_endpoint(config.s3_endpoint_url)
+            .maybe_region(config.s3_region)
+            .build_config(),
+    )
+    .await
+    .s3_with_path_style(config.s3_force_path_style)
+    .ensure_bucket(&config.s3_bucket)
+    .build()
+    .await
+    .map_err(|_error| {
+        PluginError::from(PluginInitError {
+            plugin_name: NAME.into(),
+            message: "Cannot open the configured S3 bucket".into(),
+        })
+    })?;
     S3PostgresStore::new(database, s3, config.s3_bucket)
         .await
         .map_err(|error| {
@@ -121,6 +123,9 @@ impl ImmutableStorePluginFactory for ImmutableFactory {
         parse(config).map(|_| ())
     }
     fn create(&self, config: &toml::Value) -> Result<Arc<dyn ImmutableStore>, PluginError> {
+        // The server creates its plugins once, before it serves any request, so this
+        // core waits for the store to open while no task needs it.
+        #[allow(clippy::disallowed_methods)]
         tokio::task::block_in_place(|| lore_base::runtime::runtime().block_on(open_store(config)))
             .map(|store| store as Arc<dyn ImmutableStore>)
     }

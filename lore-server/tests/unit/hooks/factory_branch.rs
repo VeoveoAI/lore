@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use lore_base::types::Context;
-use lore_server::hooks::{
-    Hook, HookContext, HookFactory, HookPoint, HookSettings, StatusCode,
-    factory_branch::FactoryBranchHookFactory,
-};
 use std::str::FromStr;
+
+use lore_base::types::Context;
+use lore_server::hooks::Hook;
+use lore_server::hooks::HookContext;
+use lore_server::hooks::HookFactory;
+use lore_server::hooks::HookPoint;
+use lore_server::hooks::HookSettings;
+use lore_server::hooks::StatusCode;
+use lore_server::hooks::factory_branch::FactoryBranchHookFactory;
 
 const REPO: &str = "0194b726b34e72b0b45550b88a967076";
 const ASSIGNED: &str = "0194b726b34e72b0b45550b88a967077";
@@ -107,12 +111,16 @@ branch="{ASSIGNED}"
 
 #[tokio::test]
 async fn both_existing_push_handlers_invoke_the_guard_with_verified_identity() {
-    use crate::{
-        notification::testing::MockNotificationSender, store::test_support::test_store_create,
-    };
-    use lore_base::{runtime::LORE_CONTEXT, types::Hash};
-    use lore_server::{auth::jwt::AuthorizationToken, hooks::HookDispatcher};
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::Hash;
+    use lore_server::auth::jwt::AuthorizationToken;
+    use lore_server::hooks::HookDispatcher;
+
+    use crate::notification::testing::MockNotificationSender;
+    use crate::store::test_support::test_store_create;
     struct Instruments;
     impl lore_telemetry::InstrumentProvider for Instruments {
         fn namespace(&self) -> &'static str {

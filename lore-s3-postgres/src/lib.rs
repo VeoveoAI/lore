@@ -1,6 +1,6 @@
 // Copyright 2026 VeoveoAI
 // SPDX-License-Identifier: MIT
-//! Native S3 payload storage with PostgreSQL partition associations and references.
+//! Native S3 payload storage with `PostgreSQL` partition associations and references.
 
 mod database;
 mod immutable;

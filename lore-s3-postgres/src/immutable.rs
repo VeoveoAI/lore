@@ -32,7 +32,7 @@ use sqlx::Transaction;
 use crate::database::Database;
 use crate::database::pg_error;
 
-/// Durable S3 objects selected atomically by a PostgreSQL index.
+/// Durable S3 objects selected atomically by a `PostgreSQL` index.
 /// Objects are immutable generations, never overwritten at a content-hash key.
 pub struct S3PostgresStore {
     database: Database,
@@ -51,7 +51,7 @@ impl S3PostgresStore {
             .bucket(&bucket)
             .send()
             .await
-            .map_err(|_| StoreError::internal("Cannot inspect S3 bucket versioning"))?;
+            .map_err(|_error| StoreError::internal("Cannot inspect S3 bucket versioning"))?;
         if versioning.status().is_some() {
             return Err(StoreError::internal(
                 "S3 PostgreSQL storage requires a bucket that has never enabled versioning",
@@ -66,7 +66,7 @@ impl S3PostgresStore {
         }))
     }
 
-    /// Share the same bounded PostgreSQL pool with the mutable store.
+    /// Share the same bounded `PostgreSQL` pool with the mutable store.
     pub fn database(&self) -> Database {
         self.database.clone()
     }
@@ -107,7 +107,7 @@ impl S3PostgresStore {
             .next()
             .ok_or_else(|| StoreError::internal("Invalid native S3 object key"))?
             .parse()
-            .map_err(|_| StoreError::internal("Invalid native S3 object key"))?;
+            .map_err(|_error| StoreError::internal("Invalid native S3 object key"))?;
         let output = self
             .s3
             .get_object(&self.bucket, key, None)
@@ -121,7 +121,7 @@ impl S3PostgresStore {
                 StoreError::internal("Referenced S3 payload could not be read")
             })?;
         let mut fragment = from_object_metadata(output.metadata())
-            .map_err(|_| StoreError::internal("Invalid S3 fragment object metadata"))?;
+            .map_err(|_error| StoreError::internal("Invalid S3 fragment object metadata"))?;
         lore_storage::validate_fragment_metadata(&fragment)?;
         let size = output
             .content_length()
@@ -139,7 +139,7 @@ impl S3PostgresStore {
             let Some(chunk) = body
                 .try_next()
                 .await
-                .map_err(|_| StoreError::internal("S3 payload stream failed"))?
+                .map_err(|_error| StoreError::internal("S3 payload stream failed"))?
             else {
                 break;
             };
@@ -155,7 +155,7 @@ impl S3PostgresStore {
             &checksum_payload
         ))
         .await
-        .map_err(|_| StoreError::internal("S3 representation checksum task failed"))?;
+        .map_err(|_error| StoreError::internal("S3 representation checksum task failed"))?;
         if key.split('/').nth(1) != Some(checksum.to_string().as_str()) {
             return Err(StoreError::internal("S3 representation checksum mismatch"));
         }
@@ -338,7 +338,7 @@ impl S3PostgresStore {
             self.s3
                 .delete_object(&self.bucket, &key, None)
                 .await
-                .map_err(|_| {
+                .map_err(|_error| {
                     StoreError::internal(
                         "S3 retired payload deletion failed; retirement retained for retry",
                     )
@@ -401,7 +401,7 @@ impl ImmutableStore for S3PostgresStore {
         for row in rows {
             let ordinal: i64 = row.get(0);
             let index = usize::try_from(ordinal - 1)
-                .map_err(|_| StoreError::internal("Invalid PostgreSQL batch ordinal"))?;
+                .map_err(|_error| StoreError::internal("Invalid PostgreSQL batch ordinal"))?;
             let asked = addresses
                 .get(index)
                 .ok_or_else(|| StoreError::internal("Invalid PostgreSQL batch ordinal"))?;
@@ -467,7 +467,7 @@ impl ImmutableStore for S3PostgresStore {
             }
         };
         let mut fragment = from_object_metadata(output.metadata())
-            .map_err(|_| StoreError::internal("Invalid S3 fragment object metadata"))?;
+            .map_err(|_error| StoreError::internal("Invalid S3 fragment object metadata"))?;
         lore_storage::validate_fragment_metadata(&fragment)?;
         if output.content_length() != Some(i64::from(fragment.size_payload)) {
             return Err(StoreError::internal(
@@ -516,7 +516,7 @@ impl ImmutableStore for S3PostgresStore {
             &checksum_payload
         ))
         .await
-        .map_err(|_| StoreError::internal("S3 representation checksum task failed"))?;
+        .map_err(|_error| StoreError::internal("S3 representation checksum task failed"))?;
         let key = format!("{}/{}/{}", address.hash, checksum, uuid::Uuid::new_v4());
         sqlx::query("INSERT INTO objects(object_key,hash,state) VALUES($1,$2,'pending')")
             .bind(&key)
@@ -534,7 +534,7 @@ impl ImmutableStore for S3PostgresStore {
                 Some(to_object_metadata(&fragment)),
             )
             .await
-            .map_err(|_| {
+            .map_err(|_error| {
                 StoreError::internal("S3 candidate upload failed; candidate remains unpublished")
             })?;
         #[cfg(feature = "test-util")]

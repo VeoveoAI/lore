@@ -19,7 +19,7 @@ pub struct Database {
     schema: String,
 }
 
-/// Accept only ordinary unquoted PostgreSQL identifiers from trusted configuration.
+/// Accept only ordinary unquoted `PostgreSQL` identifiers from trusted configuration.
 pub fn valid_schema(schema: &str) -> bool {
     !schema.is_empty()
         && schema.len() <= 63
@@ -46,7 +46,7 @@ impl Database {
             return Err(StoreError::internal("Invalid PostgreSQL schema identifier"));
         }
         let options = PgConnectOptions::from_str(url)
-            .map_err(|_| StoreError::internal("Invalid PostgreSQL connection configuration"))?
+            .map_err(|_error| StoreError::internal("Invalid PostgreSQL connection configuration"))?
             .application_name("lore-s3-postgres")
             .disable_statement_logging();
         let search_path = format!("{schema},pg_catalog");

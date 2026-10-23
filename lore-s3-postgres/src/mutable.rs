@@ -15,7 +15,7 @@ use sqlx::Row;
 use crate::database::Database;
 use crate::database::pg_error;
 
-/// PostgreSQL reference storage with native Lore absent/zero and CAS semantics.
+/// `PostgreSQL` reference storage with native Lore absent/zero and CAS semantics.
 pub struct PostgresMutableStore {
     database: Database,
 }
@@ -137,7 +137,9 @@ impl MutableStore for PostgresMutableStore {
             let value: Vec<u8> = row.get(1);
             sender
                 .send((Hash::from(key.as_slice()), Hash::from(value.as_slice())))
-                .map_err(|_| StoreError::internal("Mutable reference listing receiver closed"))?;
+                .map_err(|_error| {
+                    StoreError::internal("Mutable reference listing receiver closed")
+                })?;
         }
         Ok(stream)
     }
