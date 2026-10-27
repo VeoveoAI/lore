@@ -17,6 +17,7 @@ use super::handlers::repository_metadata_set;
 use super::handlers::repository_query;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_catalog::RepositoryCatalog;
+use crate::authnz::repository_catalog::resource_service_url;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 use crate::legacy::rpc::repository_service_server::RepositoryService;
@@ -70,10 +71,7 @@ impl RepositoryService for LoreRepositoryService {
             self.rpc_timeout,
             repository_create::handler(
                 request,
-                self.environment
-                    .endpoint
-                    .as_ref()
-                    .and_then(|endpoint| endpoint.auth_url.clone()),
+                resource_service_url(&self.environment, self.repository_catalog.as_ref()),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.hook_dispatcher,
@@ -91,10 +89,7 @@ impl RepositoryService for LoreRepositoryService {
             self.rpc_timeout,
             repository_delete::handler(
                 request,
-                self.environment
-                    .endpoint
-                    .as_ref()
-                    .and_then(|endpoint| endpoint.auth_url.clone()),
+                resource_service_url(&self.environment, self.repository_catalog.as_ref()),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self,

@@ -32,6 +32,7 @@ use super::repository_metadata_get;
 use super::repository_metadata_set;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_catalog::RepositoryCatalog;
+use crate::authnz::repository_catalog::resource_service_url;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
@@ -92,12 +93,9 @@ impl LoreRepositoryV1Service {
         }
     }
 
-    /// Auth-service URL extracted from the environment, if configured.
+    /// The auth service told of each repository created and deleted, if any.
     fn auth_url(&self) -> Option<String> {
-        self.environment
-            .endpoint
-            .clone()
-            .and_then(|endpoint| endpoint.auth_url)
+        resource_service_url(&self.environment, self.repository_catalog.as_ref())
     }
 }
 

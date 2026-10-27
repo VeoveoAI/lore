@@ -48,6 +48,12 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `lore-server`: with `[server.auth] repository_catalog = "auth_service"` and no `[environment.endpoint] auth_url`,
+  creating or deleting a repository tells the catalog's `repository_catalog_url` through `RebacApi` `CreateResource`
+  and `DeleteResource`, as `auth_url` is told when it is set. A token-claim deployment's issuer then learns of each
+  repository its people create with `lore repository create`, so it can grant and list it; the creation fails if the
+  issuer refuses it, and the issuer decides a deletion
+
 - `LORE_ACCESS_TOKEN` and `LORE_IDENTITY` supply `--access-token` and `--identity` when those flags are absent, as
   `LORE_AUTH_MODE` does for `--auth-mode`. A flag outranks its variable and an empty value counts as absent.
   `LORE_IDENTITY` does not apply beside `--identity-token`, which names its own identity, and an opaque token from the

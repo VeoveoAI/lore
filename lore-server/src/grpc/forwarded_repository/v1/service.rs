@@ -19,6 +19,8 @@ use super::repository_create;
 use super::repository_get;
 use crate::auth::jwt::JwtVerifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_catalog::RepositoryCatalog;
+use crate::authnz::repository_catalog::resource_service_url;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
@@ -37,6 +39,7 @@ pub struct LoreForwardedRepositoryV1Service {
     environment: EnvironmentConfig,
     jwt_verifier: Option<JwtVerifier>,
     authorizer: Arc<dyn RepositoryAuthorizer>,
+    repository_catalog: Arc<dyn RepositoryCatalog>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: Arc<HookDispatcher>,
@@ -45,10 +48,12 @@ pub struct LoreForwardedRepositoryV1Service {
 }
 
 impl LoreForwardedRepositoryV1Service {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         environment: EnvironmentConfig,
         jwt_verifier: Option<JwtVerifier>,
         authorizer: Arc<dyn RepositoryAuthorizer>,
+        repository_catalog: Arc<dyn RepositoryCatalog>,
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         hook_dispatcher: Arc<HookDispatcher>,
@@ -59,6 +64,7 @@ impl LoreForwardedRepositoryV1Service {
             environment,
             jwt_verifier,
             authorizer,
+            repository_catalog,
             immutable_store,
             mutable_store,
             hook_dispatcher,
@@ -67,11 +73,9 @@ impl LoreForwardedRepositoryV1Service {
         }
     }
 
+    /// The auth service told of each repository created, if any.
     fn auth_url(&self) -> Option<String> {
-        self.environment
-            .endpoint
-            .as_ref()
-            .and_then(|endpoint| endpoint.auth_url.clone())
+        resource_service_url(&self.environment, self.repository_catalog.as_ref())
     }
 }
 

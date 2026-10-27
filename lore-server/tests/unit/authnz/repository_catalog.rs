@@ -520,6 +520,40 @@ async fn construction_agrees_with_selection() {
     }
 }
 
+/// Creation and deletion tell `[environment.endpoint] auth_url` when it is
+/// set, as they always have; without it, the auth service an `auth_service`
+/// catalog lists from, so a repository created on a token-claim deployment
+/// reaches the grant store that lists it. A baseline catalog lists from
+/// the server's own store and is told nothing.
+#[tokio::test]
+async fn creation_tells_the_auth_service_the_catalog_lists_from() {
+    let environment = |auth_url: Option<&str>| lore_revision::environment::EnvironmentConfig {
+        endpoint: auth_url.map(|auth_url| lore_transport::Endpoint {
+            auth_url: Some(auth_url.to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let catalog = AuthClientRepositoryCatalog::new("https://catalog.example.com".to_string());
+    let held = baseline(BaselineAccess::Denied, &[]).await;
+    assert_eq!(
+        resource_service_url(&environment(None), &catalog).as_deref(),
+        Some("https://catalog.example.com")
+    );
+    assert_eq!(
+        resource_service_url(&environment(AUTH_URL), &catalog).as_deref(),
+        AUTH_URL
+    );
+    assert_eq!(
+        resource_service_url(&environment(None), held.as_ref()),
+        None
+    );
+    assert_eq!(
+        resource_service_url(&environment(AUTH_URL), held.as_ref()).as_deref(),
+        AUTH_URL
+    );
+}
+
 #[test]
 fn selection_display_names_the_implementation() {
     assert_eq!(

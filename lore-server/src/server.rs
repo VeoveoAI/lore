@@ -603,6 +603,7 @@ async fn launch_grpc_internal_server(
     hook_dispatcher: Arc<HookDispatcher>,
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    repository_catalog: Arc<dyn RepositoryCatalog>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let grpc_settings = settings
@@ -640,6 +641,7 @@ async fn launch_grpc_internal_server(
             settings.environment.clone().unwrap_or_default(),
             jwt_verifier,
             repository_authorizer,
+            repository_catalog,
         )?
         .with_tls_config(cert_path, key_path, cert_chain_path)?
         .with_http2_config(
@@ -2236,6 +2238,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 let hook_dispatcher = hook_dispatcher.clone();
                 let jwt_verifier = jwt_verifier.clone();
                 let repository_authorizer = repository_authorizer.clone();
+                let repository_catalog = repository_catalog.clone();
                 let shutdown_rx = _shutdown_rx.clone();
                 launch_grpc_internal_server(
                     settings,
@@ -2246,6 +2249,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     hook_dispatcher,
                     jwt_verifier,
                     repository_authorizer,
+                    repository_catalog,
                     shutdown_rx,
                 )
             });

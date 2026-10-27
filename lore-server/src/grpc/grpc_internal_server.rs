@@ -25,6 +25,7 @@ use tracing::info;
 
 use crate::auth::jwt::JwtVerifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_catalog::RepositoryCatalog;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
 use crate::grpc;
@@ -87,6 +88,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
         environment: EnvironmentConfig,
         jwt_verifier: Option<JwtVerifier>,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+        repository_catalog: Arc<dyn RepositoryCatalog>,
     ) -> anyhow::Result<GrpcInternalServerBuilder<WantsTlsConfig>> {
         if !local_immutable_store.is_local() {
             return Err(anyhow!("Immutable store must be a local store"));
@@ -101,6 +103,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
             environment,
             jwt_verifier,
             repository_authorizer,
+            repository_catalog,
         }))
     }
 }
@@ -114,6 +117,7 @@ pub struct WantsTlsConfig {
     environment: EnvironmentConfig,
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    repository_catalog: Arc<dyn RepositoryCatalog>,
 }
 
 impl GrpcInternalServerBuilder<WantsTlsConfig> {
@@ -165,6 +169,7 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
             environment: self.0.environment,
             jwt_verifier: self.0.jwt_verifier,
             repository_authorizer: self.0.repository_authorizer,
+            repository_catalog: self.0.repository_catalog,
             tls_config,
         }))
     }
@@ -179,6 +184,7 @@ pub struct WantsHttp2Config {
     environment: EnvironmentConfig,
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    repository_catalog: Arc<dyn RepositoryCatalog>,
     tls_config: Option<ServerTlsConfig>,
 }
 
@@ -230,6 +236,7 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
                 self.0.environment,
                 self.0.jwt_verifier,
                 self.0.repository_authorizer,
+                self.0.repository_catalog,
                 self.0.immutable_store,
                 self.0.mutable_store,
                 self.0.hook_dispatcher,

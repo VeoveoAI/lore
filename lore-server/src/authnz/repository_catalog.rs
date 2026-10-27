@@ -13,6 +13,7 @@ use lore_base::types::Context;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::LookupUserPermissionsRequest;
 use lore_proto::auth::LookupUserPermissionsResponse;
+use lore_revision::environment::EnvironmentConfig;
 use lore_revision::lore_debug;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
@@ -50,6 +51,26 @@ pub trait RepositoryCatalog: Send + Sync {
         page_size: Option<u32>,
         page_token: Option<&str>,
     ) -> Result<(Vec<RepositoryId>, Option<String>), Status>;
+
+    /// The auth service whose grant store this catalog lists, if it asks one.
+    fn auth_service_url(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// The auth service told of each repository this server creates and deletes, through
+/// `RebacApi`: `[environment.endpoint] auth_url`, or else the auth service an
+/// `auth_service` catalog lists from, whose grant store holds a repository only once
+/// it is told of it.
+pub fn resource_service_url(
+    environment: &EnvironmentConfig,
+    catalog: &dyn RepositoryCatalog,
+) -> Option<String> {
+    environment
+        .endpoint
+        .as_ref()
+        .and_then(|endpoint| endpoint.auth_url.clone())
+        .or_else(|| catalog.auth_service_url().map(str::to_owned))
 }
 
 impl dyn RepositoryCatalog {
@@ -223,6 +244,10 @@ impl RepositoryCatalog for AuthClientRepositoryCatalog {
             })?;
 
         Ok(repositories_from_response(permissions.into_inner()))
+    }
+
+    fn auth_service_url(&self) -> Option<&str> {
+        Some(&self.auth_url)
     }
 }
 
