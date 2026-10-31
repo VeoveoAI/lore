@@ -994,12 +994,35 @@ pub async fn clone(
     let context = execution_context();
     let call = context.globals();
 
+    // An SWFS clone mounts the repository, and a mount cannot be removed again.
+    if call.dry_run()
+        && options
+            .vfs_options
+            .as_ref()
+            .is_some_and(|vfs| vfs.vfs_type.is_swfs())
+    {
+        return Err(CloneError::from(InvalidArguments {
+            reason: "--dry-run is not supported for an SWFS clone".to_string(),
+        }));
+    }
+
     let existing_dot_dir = get_dot_lore_path(path)?;
     if existing_dot_dir.exists() {
         let existing_repository_is_swfs =
             load_repository_config_from_dot_dir(existing_dot_dir.as_path())
                 .is_ok_and(|config| config.is_swfs());
         if call.force() && !existing_repository_is_swfs {
+            // A dry run could not set up the clone without replacing the repository it would
+            // only report on, and a repository it removed cannot be restored afterwards.
+            if call.dry_run() {
+                return Err(CloneError::from(InvalidArguments {
+                    reason: format!(
+                        "--dry-run with --force would replace the repository in {}, clone to \
+                         another path to preview it",
+                        path.display()
+                    ),
+                }));
+            }
             lore_io::IoDriver::global()
                 .remove_dir_all(existing_dot_dir.as_path())
                 .await
@@ -1018,6 +1041,7 @@ pub async fn clone(
         .forward::<CloneError>("Invalid repository URL")?;
 
     let mut repository_path_guard = RepositoryCloneGuard::new(path, call.dry_run());
+    let mut dot_directory_guard = RepositoryCloneGuard::new(&existing_dot_dir, call.dry_run());
 
     // Resolve the repository name
     let repository_data = repository::resolve_by_name(&remote_url, &name, identity)
@@ -1116,19 +1140,17 @@ pub async fn clone(
     };
 
     let local_init_fut = async move {
-        {
-            let _repository = repository::create_local(
-                path,
-                &write_token,
-                repository_id,
-                default_branch_id,
-                default_branch_name,
-                repository_config,
-                no_tracking,
-            )
-            .await
-            .forward::<CloneError>("Failed to initialize repository on disk")?;
-        }
+        let created = repository::create_local(
+            path,
+            &write_token,
+            repository_id,
+            default_branch_id,
+            default_branch_name,
+            repository_config,
+            no_tracking,
+        )
+        .await
+        .forward::<CloneError>("Failed to initialize repository on disk")?;
         lore_debug!("Initialized repository on disk in {}", path.display());
 
         // Share the outer write token to whichever context we load. The Client
@@ -1140,9 +1162,13 @@ pub async fn clone(
         // `store_latest`) see a context with write capability and can populate
         // the (in-memory or on-disk) mutable store.
         let load_token = Some(write_token.share());
-        repository::load_and_connect_with_token(path, access, load_token)
+        let loaded = repository::load_and_connect_with_token(path, access, load_token)
             .await
-            .forward::<CloneError>("Failed to load revision state")
+            .forward::<CloneError>("Failed to load revision state");
+        // Kept until the loaded context has claimed the stores, so it joins the created
+        // context's claims and finds the stores current rather than reading them again.
+        drop(created);
+        loaded
     };
 
     let (repository, prefetched_branch) = tokio::try_join!(local_init_fut, prefetch_branch_fut)?;
@@ -1158,6 +1184,7 @@ pub async fn clone(
         layer,
         options,
         &mut repository_path_guard,
+        &mut dot_directory_guard,
     )
     .await
 }
@@ -1182,12 +1209,10 @@ async fn clone_into(
     layer: Option<CloneLayer>,
     options: CloneOptions,
     repository_path_guard: &mut RepositoryCloneGuard,
+    dot_directory_guard: &mut RepositoryCloneGuard,
 ) -> Result<(), CloneError> {
     let context = execution_context();
     let call = context.globals();
-
-    let mut dot_directory_guard =
-        RepositoryCloneGuard::new(repository.dot_dir_path()?, call.dry_run());
 
     // Copy the view definition if given
     let filter_view = if let Some(view) = view {
@@ -1581,8 +1606,8 @@ async fn clone_materialize(
 /// Writes the files of `ctx.state` to the working tree, discovering them in one task and writing
 /// them in another.
 ///
-/// A failure to write a file is reported ahead of a failure in discovery. Discovery fails once
-/// writing stops taking files, so its error is then a result of the failure to write.
+/// File writes continue after an individual failure. The first write failure takes precedence
+/// over a discovery failure; structural metadata errors still stop discovery.
 #[lore_macro::test_pub]
 async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
     let (file_tx, file_rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
@@ -1833,6 +1858,8 @@ pub async fn clone_execute(
     mut rx: mpsc::Receiver<CloneWorkItem>,
     ctx: CloneContext,
 ) -> Result<(), CloneError> {
+    // A missing fragment must not prevent later files from being attempted. Keep the
+    // first failure for the terminal result while reporting each failed attempt.
     let mut failure = None;
     let mut tasks: JoinSet<Result<Option<(Hash, u64)>, CloneError>> = JoinSet::new();
     let repository = ctx.repository.clone();
@@ -1880,11 +1907,14 @@ pub async fn clone_execute(
             {
                 Ok(Some(entry)) => modified_times.push(entry),
                 Ok(None) => {}
-                Err(err) => failure = failure.or(Some(err)),
+                Err(err) => {
+                    lore_warn!(
+                        "Clone could not materialize content: {err}\n{}",
+                        err.trace()
+                    );
+                    failure = failure.or(Some(err));
+                }
             }
-        }
-        if failure.is_some() {
-            break;
         }
     }
 
@@ -1895,7 +1925,13 @@ pub async fn clone_execute(
         {
             Ok(Some(entry)) => modified_times.push(entry),
             Ok(None) => {}
-            Err(err) => failure = failure.or(Some(err)),
+            Err(err) => {
+                lore_warn!(
+                    "Clone could not materialize content: {err}\n{}",
+                    err.trace()
+                );
+                failure = failure.or(Some(err));
+            }
         }
     }
 
@@ -1921,6 +1957,8 @@ pub(crate) async fn clone_node(
     let repository = ctx.repository.clone();
     let state = ctx.state.clone();
 
+    // A missing fragment must not prevent later files from being attempted. Keep the
+    // first failure for the terminal result while reporting each failed attempt.
     let mut failure = None;
     let mut tasks = JoinSet::new();
 
@@ -1961,7 +1999,14 @@ pub(crate) async fn clone_node(
                     child_states,
                 )
                 .await;
-                failure = failure.or(result.err());
+                failure = failure.or(result
+                    .inspect_err(|err| {
+                        lore_warn!(
+                            "Clone could not materialize content: {err}\n{}",
+                            err.trace()
+                        );
+                    })
+                    .err());
             }
         }
 
@@ -1969,10 +2014,13 @@ pub(crate) async fn clone_node(
             failure = failure.or(result
                 .map_err(|e| CloneError::internal_with_context(e, "Recursion task failed"))
                 .and_then(|r| r)
+                .inspect_err(|err| {
+                    lore_warn!(
+                        "Clone could not materialize content: {err}\n{}",
+                        err.trace()
+                    );
+                })
                 .err());
-        }
-        if failure.is_some() {
-            break;
         }
     }
 
@@ -1980,6 +2028,12 @@ pub(crate) async fn clone_node(
         failure = failure.or(result
             .map_err(|e| CloneError::internal_with_context(e, "Recursion task failed"))
             .and_then(|r| r)
+            .inspect_err(|err| {
+                lore_warn!(
+                    "Clone could not materialize content: {err}\n{}",
+                    err.trace()
+                );
+            })
             .err());
     }
 

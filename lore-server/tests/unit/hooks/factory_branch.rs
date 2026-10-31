@@ -38,30 +38,37 @@ fn context(user: &str, repository: &str, branch: &str) -> HookContext {
         .branch(Context::from_str(branch).unwrap())
         .build()
 }
-#[test]
-fn assigned_push_is_admitted_and_other_push_explains_both_branches() {
+#[tokio::test]
+async fn assigned_push_is_admitted_and_other_push_explains_both_branches() {
     let hook = hook();
     assert_eq!(hook.hook_points(), &[HookPoint::BranchPush]);
     assert!(
         hook.pre_handler(&context("factory-one", REPO, ASSIGNED))
+            .await
             .is_ok()
     );
     let error = hook
         .pre_handler(&context("factory-one", REPO, OTHER))
+        .await
         .unwrap_err();
     assert_eq!(error.status_code(), Some(StatusCode::FailedPrecondition));
     assert!(error.to_string().contains(&format!(
         "This factory is assigned to branch {ASSIGNED}; attempted push to branch {OTHER}."
     )));
 }
-#[test]
-fn humans_and_other_unassigned_identities_keep_normal_behavior() {
+#[tokio::test]
+async fn humans_and_other_unassigned_identities_keep_normal_behavior() {
     for identity in ["human-one", "unassigned-factory"] {
-        assert!(hook().pre_handler(&context(identity, REPO, OTHER)).is_ok());
+        assert!(
+            hook()
+                .pre_handler(&context(identity, REPO, OTHER))
+                .await
+                .is_ok()
+        );
     }
 }
-#[test]
-fn assignment_is_not_taken_from_operation_metadata() {
+#[tokio::test]
+async fn assignment_is_not_taken_from_operation_metadata() {
     let ctx = HookContext::builder()
         .correlation_id("test")
         .hook_point(HookPoint::BranchPush)
@@ -71,12 +78,13 @@ fn assignment_is_not_taken_from_operation_metadata() {
         .metadata("identity", "human-one")
         .metadata("assigned_branch", OTHER)
         .build();
-    assert!(hook().pre_handler(&ctx).is_err());
+    assert!(hook().pre_handler(&ctx).await.is_err());
 }
-#[test]
-fn repository_assignment_also_has_to_match() {
+#[tokio::test]
+async fn repository_assignment_also_has_to_match() {
     let error = hook()
         .pre_handler(&context("factory-one", OTHER, ASSIGNED))
+        .await
         .unwrap_err();
     assert!(error.to_string().contains("Assigned repository"));
 }
@@ -128,6 +136,9 @@ async fn both_existing_push_handlers_invoke_the_guard_with_verified_identity() {
         }
     }
     let (immutable, mutable, execution) = test_store_create().await.unwrap();
+    // The push holds `write`, so it reaches the pre-hooks.
+    let authorizer: Arc<dyn lore_server::authnz::repository_authorizer::RepositoryAuthorizer> =
+        Arc::new(lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer);
     let dispatcher = HookDispatcher::new(
         vec![("factory_branch".into(), hook())],
         Duration::from_millis(200),
@@ -150,6 +161,29 @@ async fn both_existing_push_handlers_invoke_the_guard_with_verified_identity() {
     };
     LORE_CONTEXT
         .scope(execution, async {
+            // The v1 handler loads the branch before its pre-hooks, to give them its name, so
+            // the attempted branch exists: the push is refused by the guard, not as not found.
+            let repository = Arc::new(
+                lore_revision::repository::RepositoryContext::new_server_context(
+                    immutable.clone(),
+                    mutable.clone(),
+                    Context::from_str(REPO).unwrap().into(),
+                ),
+            );
+            lore_revision::branch::create(
+                repository,
+                &lore_server::grpc::get_write_token(),
+                Context::from_str(OTHER).unwrap(),
+                "other",
+                lore_revision::branch::default_category(),
+                "human-one",
+                1,
+                vec![],
+                false,
+                false,
+            )
+            .await
+            .unwrap();
             let (metadata, extensions, _) = authenticated(tonic::Request::new(())).into_parts();
             let target: bytes::Bytes = Context::from_str(OTHER).unwrap().into();
             let revision: bytes::Bytes = Hash::from([1u8; 32]).into();
@@ -164,6 +198,7 @@ async fn both_existing_push_handlers_invoke_the_guard_with_verified_identity() {
             );
             let error = lore_server::grpc::handlers::branch_push::handler(
                 v0,
+                authorizer.clone(),
                 immutable.clone(),
                 mutable.clone(),
                 Arc::new(MockNotificationSender::new()),
@@ -189,6 +224,7 @@ async fn both_existing_push_handlers_invoke_the_guard_with_verified_identity() {
             );
             let error = lore_server::grpc::revision::v1::branch_push::handler(
                 v1,
+                authorizer,
                 immutable,
                 mutable,
                 Arc::new(MockNotificationSender::new()),

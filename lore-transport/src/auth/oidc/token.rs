@@ -7,6 +7,8 @@ use lore_base::lore_warn;
 use serde::Deserialize;
 
 use super::FormResponse;
+use super::PostError;
+use super::body_excerpt;
 use super::on_net_runtime;
 use super::post_form;
 use crate::error::ProtocolError;
@@ -32,21 +34,18 @@ pub struct ErrorResponse {
 }
 
 impl ErrorResponse {
-    /// A recognized protocol code, without provider-controlled descriptions or values.
+    /// The error code with its description, both bounded, since both are the provider's
+    /// text.
     pub fn describe(&self) -> String {
-        match self.error.as_str() {
-            "invalid_request"
-            | "invalid_client"
-            | "invalid_grant"
-            | "unauthorized_client"
-            | "unsupported_grant_type"
-            | "invalid_scope"
-            | "invalid_target"
-            | "access_denied"
-            | "authorization_pending"
-            | "slow_down"
-            | "expired_token" => self.error.clone(),
-            _ => "unrecognized OAuth error".to_owned(),
+        match self.error_description.as_deref() {
+            Some(description) if !description.is_empty() => {
+                format!(
+                    "{}: {}",
+                    body_excerpt(&self.error),
+                    body_excerpt(description)
+                )
+            }
+            _ => body_excerpt(&self.error),
         }
     }
 }
@@ -70,16 +69,52 @@ pub(super) async fn request<T>(
 where
     T: for<'de> Deserialize<'de> + Send + 'static,
 {
+    request_authorized(what, endpoint, form, None).await
+}
+
+/// [`request`] with `authorization` as the `Authorization` header, for a client that
+/// authenticates with HTTP Basic (RFC 6749 §2.3.1).
+pub(super) async fn request_authorized<T>(
+    what: &'static str,
+    endpoint: &str,
+    form: Vec<(&'static str, String)>,
+    authorization: Option<String>,
+) -> Result<Outcome<T>, ProtocolError>
+where
+    T: for<'de> Deserialize<'de> + Send + 'static,
+{
+    request_once(what, endpoint, form, authorization)
+        .await
+        .map_err(ProtocolError::from)
+}
+
+/// [`request_authorized`], telling a failure that sent nothing from one after which the
+/// provider may have acted on the request. Everything after a response arrives, a refusal
+/// that cannot be read and an unusable success included, may have been acted on.
+pub(super) async fn request_once<T>(
+    what: &'static str,
+    endpoint: &str,
+    form: Vec<(&'static str, String)>,
+    authorization: Option<String>,
+) -> Result<Outcome<T>, PostError>
+where
+    T: for<'de> Deserialize<'de> + Send + 'static,
+{
     let endpoint = endpoint.to_owned();
     on_net_runtime(async move {
         let form: Vec<(&str, &str)> = form
             .iter()
             .map(|(name, value)| (*name, value.as_str()))
             .collect();
-        let response = post_form(what, &endpoint, &form).await?;
-        parse(what, &response)
+        Ok(
+            match post_form(what, &endpoint, &form, authorization.as_deref()).await {
+                Ok(response) => parse(what, &response).map_err(PostError::MaybeSent),
+                Err(error) => Err(error),
+            },
+        )
     })
     .await
+    .map_err(PostError::MaybeSent)?
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(
@@ -89,9 +124,12 @@ fn parse<T: for<'de> Deserialize<'de>>(
     if response.status.is_success() {
         return serde_json::from_slice(&response.body)
             .map(Outcome::Token)
-            .map_err(|_untrusted_response| {
-                lore_warn!("OIDC {what} response is malformed");
-                ProtocolError::internal("OIDC token endpoint response is malformed")
+            .map_err(|source| {
+                lore_warn!("OIDC {what} response is malformed: {source}");
+                ProtocolError::internal_with_context(
+                    source,
+                    "reading the identity provider's response",
+                )
             });
     }
     if response.status.is_client_error()
@@ -99,8 +137,11 @@ fn parse<T: for<'de> Deserialize<'de>>(
     {
         return Ok(Outcome::Refused(refusal));
     }
-    // A token endpoint can echo the submitted credential in an error body.
-    lore_warn!("OIDC {what} answered HTTP {}", response.status.as_u16());
+    lore_warn!(
+        "OIDC {what} answered HTTP {}: {}",
+        response.status.as_u16(),
+        response.body_text()
+    );
     Err(ProtocolError::internal(format!(
         "OIDC {what} answered HTTP {}",
         response.status.as_u16()
@@ -121,9 +162,10 @@ pub fn authentication_token(response: TokenResponse) -> Result<AuthenticationTok
         id_token,
     } = response;
     if !token_type.eq_ignore_ascii_case("bearer") {
-        return Err(ProtocolError::internal(
-            "OIDC token endpoint issued an unsupported token type; only Bearer is supported",
-        ));
+        return Err(ProtocolError::internal(format!(
+            "OIDC token endpoint issued a token of type '{}'; only Bearer is supported",
+            body_excerpt(&token_type)
+        )));
     }
     let Ok(decoded) = lore_credential::insecure_decode_token(&access_token) else {
         return Err(ProtocolError::internal(

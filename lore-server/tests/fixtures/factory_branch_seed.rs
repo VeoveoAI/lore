@@ -10,8 +10,10 @@ use lore_base::runtime::runtime;
 use lore_base::types::Context;
 use lore_revision::branch;
 use lore_revision::repository::RepositoryContext;
+use lore_server::authnz::repository_registry::RepositoryRegistry;
 use lore_server::grpc::forwarded_requests::CallerContext;
 use lore_server::grpc::get_write_token;
+use lore_server::grpc::handlers::branch_push::PushAccess;
 use lore_server::grpc::repository::v1::repository_create::repository_create_implementation;
 use lore_server::hooks::HookDispatcher;
 
@@ -42,7 +44,7 @@ fn main() -> anyhow::Result<()> {
         for (id, default_branch) in [(repository, main), (forbidden, Context::from(uuid::Uuid::now_v7()))] {
             repository_create_implementation(lore_proto::lore::repository::v1::RepositoryCreateRequest {
                 id: id.data().to_vec().into(), name: format!("vv-hook-fixture-{id}"), default_branch_id: default_branch.data().to_vec().into(), default_branch_name: "main".into(), ..Default::default()
-            }, CallerContext { repository_id: Default::default(), user_id: "fixture-operator".into(), correlation_id: String::new(), authorization: None }, None, immutable.clone(), mutable.clone(), &HookDispatcher::empty(), &Instruments).await?;
+            }, CallerContext { repository_id: Default::default(), user_id: "fixture-operator".into(), is_service_account: false, correlation_id: String::new(), authorization: None }, &RepositoryRegistry::Unregistered, immutable.clone(), mutable.clone(), &HookDispatcher::empty(), &Instruments).await?;
         }
         let context = Arc::new(RepositoryContext::new_server_context(immutable.clone(), mutable.clone(), repository.into()));
         for (id, name) in [(assigned, "assigned"), (other, "other-author")] {
@@ -59,7 +61,7 @@ fn main() -> anyhow::Result<()> {
             state.set_metadata_hash(metadata_hash);
             let revision = state.serialize(context.clone(), &get_write_token()).await?;
             lore_server::grpc::handlers::branch_push::push(
-                context.clone(), id, revision, false, false, false,
+                context.clone(), id, revision, PushAccess { write: true, push_protected: false }, false, false,
                 branch::DEFAULT_HISTORY_STEP_SIZE, Default::default(),
             ).await?;
         }

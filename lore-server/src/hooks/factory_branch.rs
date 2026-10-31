@@ -48,7 +48,7 @@ impl Hook for FactoryBranchHook {
         &[HookPoint::BranchPush]
     }
 
-    fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
+    async fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
         if ctx.hook_point() != HookPoint::BranchPush {
             return Ok(());
         }

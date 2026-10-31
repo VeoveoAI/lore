@@ -108,13 +108,15 @@ async fn refresh_child() {
 
 #[tokio::test]
 async fn processes_reload_the_rotated_grant_under_the_native_lock() {
+    // The processes present the first grant; this process presents the one it rotated to.
     let provider = spawn_recording_provider(|issuer, request, nth| match request.path.as_str() {
         "/token" => {
-            assert_eq!(nth, 0, "a one-time grant must be consumed only once");
-            assert_eq!(request.form()["refresh_token"], "process-refresh-1");
+            assert!(nth < 2, "a one-time grant must be consumed only once");
+            let presented = format!("process-refresh-{}", nth + 1);
+            assert_eq!(request.form()["refresh_token"], presented);
             json(
-                &serde_json::json!({"access_token": token(issuer, 2_000_000_000),
-                "token_type": "Bearer", "refresh_token": "process-refresh-2"}),
+                &serde_json::json!({"access_token": token(issuer, 2_000_000_000 + nth as u64),
+                "token_type": "Bearer", "refresh_token": format!("process-refresh-{}", nth + 2)}),
             )
         }
         _ => conforming(issuer, nth),
@@ -122,13 +124,13 @@ async fn processes_reload_the_rotated_grant_under_the_native_lock() {
     .await;
     let endpoint = endpoint(&provider.issuer);
     let store = PathBuf::from(std::env::var_os("LORE_AUTH_PATH").unwrap());
-    token_store::store_user_grant(
+    token_store::store_user_token_and_refresh_token(
         &endpoint.url,
         IDENTITY,
         &token(&provider.issuer, 1),
         vec![DOMAIN.to_owned()],
         Some("process-refresh-1"),
-        Some(CLIENT),
+        None,
     )
     .await
     .unwrap();
@@ -176,11 +178,27 @@ async fn processes_reload_the_rotated_grant_under_the_native_lock() {
     .await
     .unwrap();
     assert_eq!(provider.requests_to("/token").len(), 1);
-    let stored = token_store::lock_user_token(&endpoint.url, IDENTITY, vulnerable_all_tokens())
-        .await
-        .unwrap();
-    assert_eq!(stored.token(), token(&provider.issuer, 2_000_000_000));
-    assert_eq!(stored.refresh_token(), Some("process-refresh-2"));
+
+    // This process still caches the expired token. Its renewal reloads the store under the
+    // lock, finds the token the processes stored, and makes no grant of its own.
+    let selected =
+        auth_exchange(&endpoint, DOMAIN, IDENTITY, RepositoryId::default(), "", "").await;
+    assert_eq!(selected.0, token(&provider.issuer, 2_000_000_000));
+    assert_eq!(provider.requests_to("/token").len(), 1);
+
+    // Expiring the stored token again keeps its refresh token, which is the rotated one.
+    token_store::store_user_token(
+        &endpoint.url,
+        IDENTITY,
+        &token(&provider.issuer, 1),
+        vec![DOMAIN.to_owned()],
+    )
+    .await
+    .unwrap();
+    let selected =
+        auth_exchange(&endpoint, DOMAIN, IDENTITY, RepositoryId::default(), "", "").await;
+    assert_eq!(selected.0, token(&provider.issuer, 2_000_000_001));
+    assert_eq!(provider.requests_to("/token").len(), 2);
 }
 
 /// Reaps children even if a barrier assertion or timeout fails.

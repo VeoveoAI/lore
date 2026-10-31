@@ -15,6 +15,7 @@ use lore_base::types::Partition;
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -49,7 +50,7 @@ impl RepositoryAuthorizer for FixedPartitionsAuthorizer {
         &self,
         _token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        _action: Option<&str>,
+        _action: Action,
     ) -> Result<(), tonic::Status> {
         if self.0.contains(&repository_id) {
             Ok(())
@@ -79,6 +80,16 @@ struct MockCopyFailStore;
 
 #[async_trait]
 impl ImmutableStore for MockCopyFailStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn query(
         self: Arc<Self>,
         _partition: Partition,
@@ -180,6 +191,16 @@ struct MockCopySuccessStore;
 
 #[async_trait]
 impl ImmutableStore for MockCopySuccessStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn query(
         self: Arc<Self>,
         _partition: Partition,

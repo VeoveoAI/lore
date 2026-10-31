@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! Offline checks of a store directory: its files as a killed process left them, then the store
-//! reopened, its index against its packfiles, and every key against the journal.
+//! reopened, its index against its packfiles, every key against the journal, and the mutable
+//! store's keys and counters against it, see [`crate::mutable::verify`].
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -102,12 +103,18 @@ pub async fn main(args: &Args) -> u8 {
         let class = violation.split(' ').nth(2).unwrap_or("unknown");
         report.violation(&format!("online-{class}"), violation.clone());
     }
+    for overlap in &history.overlaps {
+        report.violation("claims-overlapped", overlap.clone());
+    }
     audit_files(&dir, &config, &mut report);
 
+    crate::coverage::capture_logs();
     let mut code = check_store(&dir, &config, &history, &mut report, "first open", false).await;
+    crate::mutable::verify(&dir, &config, &history, &mut report).await;
     if code == 0 && args.flag("deep") {
         code = deep(&dir, &config, &history, &mut report).await;
     }
+    repairs(&mut report);
     println!(
         "journal: {} lines, {} generations, {} clean ends",
         history.lines, history.generations, history.clean_ends
@@ -125,6 +132,23 @@ pub async fn main(args: &Args) -> u8 {
     }
 }
 
+/// Each repair the stores logged while verify opened and checked them, as a violation: dropping a
+/// bucket file they could not parse, or the locations of payloads past the end of their packfile.
+/// Every file the stores write lands whole or not at all, and every payload before the entry that
+/// points at it, so neither a process stopped at any point nor a failed file operation leaves what
+/// these repair; only a machine losing writes, which the suite does not simulate, or a defect does.
+fn repairs(report: &mut Report) {
+    for (milestone, class) in crate::coverage::REPAIRS {
+        let reached = crate::coverage::reached(milestone);
+        if reached > 0 {
+            report.violation(
+                class,
+                format!("the stores logged {milestone} {reached} times"),
+            );
+        }
+    }
+}
+
 /// Compact every group, flush with a sync, reopen, and check again, so that whatever the first
 /// open left latent, such as an entry compaction would rewrite wrongly, shows. Compaction evicts
 /// by size first, which may take every payload eviction may take.
@@ -135,13 +159,20 @@ async fn deep(dir: &Path, config: &Config, history: &History, report: &mut Repor
             return 0;
         };
         let store: Arc<dyn ImmutableStore> = store;
+        let _span = match store.clone().hold_for_command().await {
+            Ok(span) => span,
+            Err(err) => {
+                report.violation("claim-failed", format!("deep reopen: {err}"));
+                return 0;
+            }
+        };
         let mut at = None;
         loop {
             match store.clone().compact(1, at, true, None).await {
                 Ok(Some(next)) => at = Some(next),
                 Ok(None) => break,
                 Err(err) => {
-                    report.note("deep-compaction-error", err.to_string());
+                    report.violation("deep-compaction-error", err.to_string());
                     break;
                 }
             }
@@ -287,6 +318,14 @@ async fn check_store(
     };
     println!("{phase}: opened in {:.3}s", opened.elapsed().as_secs_f64());
     let dyn_store: Arc<dyn ImmutableStore> = store.clone();
+    // Claimed as a command claims a store, so that the checks take no claim each.
+    let _span = match dyn_store.clone().hold_for_command().await {
+        Ok(span) => span,
+        Err(err) => {
+            report.violation("claim-failed", format!("{phase}: {err}"));
+            return 0;
+        }
+    };
     let loaded = Instant::now();
     if let Err(err) = dyn_store.clone().load_index().await {
         report.violation("load-index-failed", format!("{phase}: {err}"));
@@ -1069,6 +1108,115 @@ fn stale_new_file(path: &Path, config: &Config, lengths: &[Option<u64>], report:
             }
         }
     }
+}
+
+/// What an entry records, its access stamp left out.
+type EntryRecord = (
+    Hash,
+    lore_storage::Partition,
+    lore_storage::Context,
+    u32,
+    u32,
+    u64,
+    u32,
+    u32,
+);
+
+/// What `entry` records, its access stamp left out.
+fn record_of(entry: &ImmutableStoreEntry) -> EntryRecord {
+    let data = &entry.data;
+    (
+        entry.address.hash,
+        entry.partition,
+        entry.address.context,
+        data.flags,
+        data.size_payload,
+        data.size_content,
+        data.pack_offset,
+        data.pack_file,
+    )
+}
+
+/// The entries the bucket file at `path` records, sorted, none for a missing file, or why they
+/// cannot be read: the file could not be read, or is not laid out as this store writes them.
+fn bucket_file_records(path: &Path) -> Result<Vec<EntryRecord>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(err) => return Err(format!("the file could not be read: {err}")),
+    };
+    parse_bucket_file(&bytes).ok_or_else(|| "the file does not parse".to_string())
+}
+
+/// The entries `bytes`, a bucket file's contents, record, sorted, or `None` for a file not laid
+/// out as this store writes them.
+fn parse_bucket_file(bytes: &[u8]) -> Option<Vec<EntryRecord>> {
+    use zerocopy::FromBytes;
+    let count = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?) as usize;
+    let size = size_of::<ImmutableStoreEntry>();
+    let entries = bytes.get(HEADER_SIZE + count * 4..HEADER_SIZE + count * (4 + size))?;
+    let mut records: Vec<EntryRecord> = entries
+        .chunks_exact(size)
+        .map(|entry| {
+            ImmutableStoreEntry::read_from_bytes(entry)
+                .ok()
+                .map(|entry| record_of(&entry))
+        })
+        .collect::<Option<_>>()?;
+    records.sort_unstable();
+    Some(records)
+}
+
+/// Each bucket of `store` whose file on disk records other entries than its memory holds, leaving
+/// out buckets flagged for a flush: what an older write of a bucket file landing over a newer one
+/// leaves, which reads from memory never see and the next flush of the bucket repairs. Each group
+/// is held under its flush lock, so that no write of it is in flight.
+pub async fn files_behind_memory(store: &Arc<LocalImmutableStore>) -> Vec<String> {
+    let Some(path) = store.path.clone() else {
+        return vec![];
+    };
+    let index = path.join("index");
+    let mut findings = vec![];
+    for (group_index, group) in store.group.iter().enumerate() {
+        let level = group.bucket_count.load(atomic::Ordering::Relaxed);
+        if !(0..level).any(|bucket| group.try_bucket(bucket).is_some()) {
+            continue;
+        }
+        let _flushing =
+            lore_storage::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
+        if group.pending_level.load(atomic::Ordering::Relaxed) != 0
+            || group.committed_level.load(atomic::Ordering::Relaxed) != level
+        {
+            continue;
+        }
+        let directory = lore_storage::local::fan_out::group_dir_path(&index, group_index);
+        for bucket_index in 0..level {
+            let Some(bucket) = group.try_bucket(bucket_index) else {
+                continue;
+            };
+            let bucket = bucket.read().await;
+            if !bucket.deserialized || group.needs_flush(bucket_index) {
+                continue;
+            }
+            let mut memory: Vec<EntryRecord> = bucket.entry.iter().map(record_of).collect();
+            memory.sort_unstable();
+            let file = lore_storage::local::fan_out::bucket_path(&directory, bucket_index);
+            match bucket_file_records(&file) {
+                Ok(records) if records == memory => {}
+                Ok(records) => findings.push(format!(
+                    "group {group_index:02x} bucket {bucket_index:02x}: the file records {} entries, \
+                     {} of them not in memory, which holds {} entries",
+                    records.len(),
+                    records.iter().filter(|record| memory.binary_search(record).is_err()).count(),
+                    memory.len()
+                )),
+                Err(reason) => findings.push(format!(
+                    "group {group_index:02x} bucket {bucket_index:02x}: {reason}"
+                )),
+            }
+        }
+    }
+    findings
 }
 
 /// The header and recorded packfile sizes of one bucket file, against the packfiles.

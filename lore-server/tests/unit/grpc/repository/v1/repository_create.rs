@@ -66,6 +66,7 @@ mod forwarded_request {
     use lore_proto::lore::repository::v1::RepositoryCreateRequest;
     use lore_proto::lore::repository::v1::RepositoryCreateResponse;
     use lore_revision::lore::RepositoryId;
+    use lore_server::authnz::repository_registry::RepositoryRegistry;
     use lore_server::grpc::forwarded_requests::ForwardedRequestResult;
     use lore_server::grpc::forwarded_requests::ForwardedRequests;
     use lore_server::grpc::forwarded_requests::InternalClientError;
@@ -163,6 +164,13 @@ mod forwarded_request {
                 response: Arc::clone(&self.response),
             })
         }
+
+        fn forwarded_lock_service(
+            &self,
+        ) -> Box<dyn lore_server::grpc::forwarded_requests::lock_service::ForwardedLockServiceClient>
+        {
+            unreachable!("forwarded_lock_service should not be called in repository_create tests")
+        }
     }
 
     fn make_request(repository_id: RepositoryId, name: &str) -> Request<RepositoryCreateRequest> {
@@ -201,7 +209,7 @@ mod forwarded_request {
 
             let response = handler(
                 make_request(repository_id, "test-repo"),
-                None, /* no auth */
+                &RepositoryRegistry::Unregistered,
                 immutable_store,
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -236,7 +244,7 @@ mod forwarded_request {
 
             let err = handler(
                 make_request(repository_id, "test-repo"),
-                None,
+                &RepositoryRegistry::Unregistered,
                 immutable_store,
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -267,7 +275,7 @@ mod forwarded_request {
 
             let err = handler(
                 make_request(repository_id, "test-repo"),
-                None,
+                &RepositoryRegistry::Unregistered,
                 immutable_store,
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -300,7 +308,7 @@ mod forwarded_request {
 
             let response = handler(
                 make_request(repository_id, "my-repo"),
-                None, /* no auth */
+                &RepositoryRegistry::Unregistered,
                 immutable_store,
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),

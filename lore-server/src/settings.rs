@@ -26,6 +26,8 @@ use crate::grpc::server::FeatureSettings;
 use crate::grpc::server::GrpcPublicServicesSettings;
 use crate::hooks::HookSettings;
 use crate::quic::client_monitor::default_quic_client_monitor_interval_secs;
+use crate::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
+use crate::quic::initial_cwnd::InitialCwndBytes;
 use crate::store::replica_factory::ReplicaFactorySettings;
 use crate::tls::CertificateSettings;
 use crate::topology::TopologySettings;
@@ -187,11 +189,16 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
         .as_ref()
         .and_then(|environment| environment.endpoint.as_ref())
         .and_then(|endpoint| endpoint.auth_url.as_deref());
+    let user_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.user_url.as_deref());
     // Run the authorizer and catalog selection at load, so a refused pairing
     // bails here, before any initialization, instead of at server startup.
     let authorizer = select_repository_authorizer(auth, auth_url)
         .map_err(|err| config::ConfigError::Message(err.to_string()))?;
-    select_repository_catalog(auth, auth_url)
+    select_repository_catalog(auth, auth_url, user_url)
         .map_err(|err| config::ConfigError::Message(err.to_string()))?;
     let Some(auth) = auth else {
         return Ok(());
@@ -387,6 +394,12 @@ pub struct AuthSettings {
     pub jwt_typ: Option<Vec<String>>,
     /// Dotted path of the JWT claim carrying the caller's allowed actions.
     pub permission_claim: Option<String>,
+    /// Tier 1 only: the actions every token holder gets, added to whatever
+    /// `permission_claim` carries and to `read`, which any token implies.
+    /// Absent means `["write"]`. Read
+    /// through [`AuthSettings::implicit_actions`]; `None` is kept distinct so
+    /// startup can refuse an explicit value that would do nothing.
+    pub implicit_actions: Option<Vec<crate::authnz::repository_authorizer::Action>>,
     /// Dotted path of the claim carrying per-repository resource grants.
     /// If this is set, enables the granular `ResourceGrantsAuthorizer`.
     pub resource_claim: Option<String>,
@@ -407,8 +420,9 @@ pub struct AuthSettings {
     /// access to the contents. Consulted by the `baseline` catalog only.
     #[serde(default)]
     pub baseline_access: BaselineAccess,
-    /// Which catalog answers the repository listing. Absent: `auth_service`
-    /// when `[environment.endpoint] auth_url` is set, `baseline` otherwise.
+    /// Which catalog answers the repository listing. Absent: `user_service`
+    /// when `[environment.endpoint] user_url` is set, else `auth_service`
+    /// when `auth_url` is set, `baseline` otherwise.
     pub repository_catalog: Option<RepositoryCatalogMode>,
     /// The `UrcAuthApi` endpoint the `auth_service` catalog asks. Absent:
     /// `[environment.endpoint] auth_url`.
@@ -443,6 +457,12 @@ pub struct OidcSettings {
 }
 
 impl AuthSettings {
+    pub fn implicit_actions(&self) -> Vec<crate::authnz::repository_authorizer::Action> {
+        self.implicit_actions
+            .clone()
+            .unwrap_or_else(|| vec![crate::authnz::repository_authorizer::Action::Write])
+    }
+
     fn default_resource_id_template() -> String {
         crate::auth::jwt::DEFAULT_RESOURCE_ID_TEMPLATE.to_string()
     }
@@ -479,6 +499,9 @@ pub enum RepositoryCatalogMode {
     /// Ask a `UrcAuthApi` service's `LookupUserPermissions`, forwarding the
     /// caller's token.
     AuthService,
+    /// Ask `PartitionList` on the `lore.user.v1.UserService` at
+    /// `[environment.endpoint] user_url`, forwarding the caller's token.
+    UserService,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -581,6 +604,10 @@ pub struct QuicSettings {
     pub port: i32,
     pub transport_bits_per_second: Option<usize>,
     pub transport_rtt: Option<usize>,
+    /// Congestion window each accepted connection starts with: how much the server sends before
+    /// the peer's first acknowledgements arrive. When unset, the internal endpoint uses 1 MiB and
+    /// the public endpoint its congestion controller's own default.
+    pub initial_cwnd_bytes: Option<InitialCwndBytes>,
     /// Keep below a threshold for whatever Load Balancer sits infront of the server
     /// or is expecting responses. If request handlers exceed this reasonable threshold
     /// then assume something has gone wrong and return a timeout response so we can get metrics
@@ -599,6 +626,21 @@ pub struct QuicSettings {
     pub permit_timeout_ms: Option<u64>,
 }
 
+/// Only Lore servers connect to the internal endpoint, so its connections start with the window
+/// known to suit the path between peers rather than the controller's default.
+fn deserialize_quic_internal<'de, D>(deserializer: D) -> Result<Option<QuicSettings>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut settings = Option::<QuicSettings>::deserialize(deserializer)?;
+    if let Some(settings) = settings.as_mut() {
+        settings
+            .initial_cwnd_bytes
+            .get_or_insert(DEFAULT_PEER_INITIAL_CWND_BYTES);
+    }
+    Ok(settings)
+}
+
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct ServerSettings {
@@ -613,6 +655,7 @@ pub struct ServerSettings {
     // the public facing QUIC server settings
     pub quic: Option<QuicSettings>,
     // the internal-only QUIC server settings
+    #[serde(default, deserialize_with = "deserialize_quic_internal")]
     pub quic_internal: Option<QuicSettings>,
     /// Seconds to wait for existing connections to close gracefully after shutdown signal.
     #[serde(default = "default_connection_close_timeout")]

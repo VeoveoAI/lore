@@ -32,11 +32,6 @@ pub struct UserInfo {
 pub struct JWTUserInfo {
     #[serde(rename = "iss")]
     pub issuer: String,
-    /// The OAuth client identified by the issuer, when carried in the access token.
-    #[serde(default)]
-    pub azp: Option<String>,
-    #[serde(default)]
-    pub client_id: Option<String>,
     /// The subject. The identity this token names may be another claim, see
     /// [`JWTUserInfo::identity`].
     #[serde(rename = "sub")]

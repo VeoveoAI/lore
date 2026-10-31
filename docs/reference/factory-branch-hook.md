@@ -19,16 +19,19 @@ The trusted installation/integration owns this server configuration. Reload it
 through Lore's normal configuration/startup workflow; never take assignments from
 agent-owned repository files, CLI flags or request headers. Use an authenticated
 server with the configured verified identity claim (`sub` by default). Factory
-credentials need a distinct verified identity and ordinary repository access;
-never set `is_service_account` just because the caller is automated.
+credentials need a distinct verified identity and `write` on the repository;
+never grant `push-protected` just because the caller is automated.
 
 The check compares stable repository and branch IDs, so a branch rename does not
 change its assignment. A rejected push names the assigned and attempted branch
 IDs. The hook uses the existing `FailedPrecondition` business-rule rejection so
 ordinary Lore clients retain the explanatory message (`PermissionDenied` is
 rendered as a generic authorization error by the stock client). Identities absent from `assignments`, including normal human users, keep their
-existing permissions. An admitted push still passes through native branch
-protection and the ordinary push/merge implementation.
+existing permissions. A push reaches the hook only after the push handler has
+found that the caller holds `write` or `push-protected` on the repository, and
+before the branch's own check: an admitted push still passes through native
+branch protection, where a protected branch needs `push-protected` and any other
+branch `write`, and the ordinary push/merge implementation.
 
 This is a guard on normal push operations, not a per-branch security boundary.
 It does not isolate every storage RPC, restrict all branch administration, or

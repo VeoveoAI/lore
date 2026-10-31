@@ -78,18 +78,22 @@ pub struct LoreCli {
     pub local: bool,
 
     /// Use given identity. `LORE_IDENTITY` supplies it when the flag is absent,
-    /// unless --identity-token names one
+    /// unless an identity token, from --identity-token or `LORE_IDENTITY_TOKEN`,
+    /// names one
     #[clap(global = true, long, action)]
     pub identity: Option<String>,
 
     /// Use given authentication token instead of one from the secure store. Acts
-    /// as the identity the token was issued to
+    /// as the identity the token was issued to. Read from `LORE_IDENTITY_TOKEN` when
+    /// omitted. Unsafe: a value given here is visible to other users in the
+    /// process table and is kept in the shell history
     #[clap(global = true, long, value_name = "token", conflicts_with = "identity")]
     pub identity_token: Option<String>,
 
     /// Use given authorization token instead of exchanging one with the
-    /// authentication service. Opaque tokens require --identity.
-    /// `LORE_ACCESS_TOKEN` supplies it when the flag is absent
+    /// authentication service. Opaque tokens require --identity. Read from
+    /// `LORE_ACCESS_TOKEN` when omitted. Unsafe: a value given here is visible to
+    /// other users in the process table and is kept in the shell history
     #[clap(global = true, long, value_name = "token")]
     pub access_token: Option<String>,
 
@@ -444,6 +448,7 @@ pub fn resolve_auth_mode(
     Ok(AuthMode::Auto)
 }
 
+pub const IDENTITY_TOKEN_VAR: &str = "LORE_IDENTITY_TOKEN";
 pub const ACCESS_TOKEN_VAR: &str = "LORE_ACCESS_TOKEN";
 pub const IDENTITY_VAR: &str = "LORE_IDENTITY";
 
@@ -468,6 +473,29 @@ pub fn resolve_credential(
     Ok((!from_env.trim().is_empty()).then_some(from_env))
 }
 
+/// A secret from its flag, or else from its environment variable. A blank variable reads
+/// as unset.
+pub fn resolve_secret(from_flag: Option<&str>, from_env: Option<OsString>) -> Option<String> {
+    if let Some(from_flag) = from_flag {
+        return Some(from_flag.to_owned());
+    }
+    from_env
+        .map(|from_env| from_env.to_string_lossy().into_owned())
+        .filter(|from_env| !from_env.trim().is_empty())
+}
+
+/// [`resolve_secret`] from the variable `var`. A secret given as `flag` warns, since other
+/// users can read it in the process table and the shell history keeps it.
+pub fn secret_from_flag_or_env(flag: &str, from_flag: Option<&str>, var: &str) -> Option<String> {
+    if from_flag.is_some() {
+        eprintln!(
+            "Warning: the value of {flag} is visible to other users in the process table and is \
+             kept in the shell history. Set {var} instead."
+        );
+    }
+    resolve_secret(from_flag, std::env::var_os(var))
+}
+
 pub fn lore_globals_from_args(cli: &LoreCli) -> Result<LoreGlobalArgs, LoreCliError> {
     let mut args = LoreGlobalArgs {
         repository_path: get_repository_path(cli.repository.clone()),
@@ -482,13 +510,7 @@ pub fn lore_globals_from_args(cli: &LoreCli) -> Result<LoreGlobalArgs, LoreCliEr
         cache: cli.cache.into(),
         trust_remote: cli.trust_remote.into(),
 
-        identity_token: cli.identity_token.clone().into(),
-        access_token: resolve_credential(
-            cli.access_token.as_deref(),
-            std::env::var_os(ACCESS_TOKEN_VAR),
-            ACCESS_TOKEN_VAR,
-        )?
-        .into(),
+        identity: cli.identity.clone().into(),
 
         search_limit: cli.search_limit.unwrap_or_default() as u32,
         search_nearest: cli.search_nearest.into(),
@@ -527,11 +549,29 @@ pub fn lore_globals_from_args(cli: &LoreCli) -> Result<LoreGlobalArgs, LoreCliEr
         0
     };
 
+    // An explicit identity outranks an identity token in the environment, as it
+    // conflicts with the identity token flag.
+    if cli.identity.is_none() {
+        args.identity_token = secret_from_flag_or_env(
+            "--identity-token",
+            cli.identity_token.as_deref(),
+            IDENTITY_TOKEN_VAR,
+        )
+        .into();
+    }
+    // An access token goes with an explicit identity, which an opaque one requires.
+    args.access_token = secret_from_flag_or_env(
+        "--access-token",
+        cli.access_token.as_deref(),
+        ACCESS_TOKEN_VAR,
+    )
+    .into();
+
     args.auth_mode = resolve_auth_mode(cli.auth_mode, std::env::var_os(AUTH_MODE_VAR))?;
 
     // An identity token names the identity it acts as, which the parser keeps
     // --identity from contradicting; the variable does not contradict it either.
-    if cli.identity_token.as_deref().is_none_or(str::is_empty) {
+    if args.identity_token.is_empty() {
         args.identity = resolve_credential(
             cli.identity.as_deref(),
             std::env::var_os(IDENTITY_VAR),

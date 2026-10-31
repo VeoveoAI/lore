@@ -61,6 +61,8 @@ pub type LoreFileResetProgressEventData =
     lore_revision::file::reset::LoreFileResetProgressEventData;
 pub type LoreFileResetCountData = lore_revision::file::reset::LoreFileResetCountData;
 pub type LoreFileUnstageCountData = lore_revision::file::unstage::LoreFileUnstageCountData;
+pub type LoreFileAuditEventData = lore_revision::file::audit::LoreFileAuditEventData;
+pub type LoreFileAuditOutcome = lore_revision::file::audit::LoreFileAuditOutcome;
 pub type LorePathIgnoreEventData = lore_revision::path::LorePathIgnoreEventData;
 pub type LoreRevisionHistoryEntryEventData =
     lore_revision::revision::history::LoreRevisionHistoryEntryEventData;
@@ -151,7 +153,8 @@ pub extern "C" fn lore_auth_user_info_async(
 
 pub type LoreAuthLoginWithTokenArgs = crate::auth::LoreAuthLoginWithTokenArgs;
 
-/// Authenticate using an existing bearer token.
+/// Authenticate using an existing bearer token, or, when `client_id` is set, as the
+/// registered client it names with `client_secret`.
 ///
 /// # Events
 ///
@@ -236,6 +239,10 @@ pub extern "C" fn lore_auth_list_async(
 pub type LoreAuthLogoutArgs = crate::auth::LoreAuthLogoutArgs;
 
 /// Remove stored authentication and authorization tokens.
+///
+/// Each login removed with its refresh token is then revoked if the auth service offers
+/// revocation. A failed revocation fails the call after the tokens are removed, so a non-zero
+/// return value or `LORE_EVENT_COMPLETE` status does not mean the tokens are still stored.
 ///
 /// # Events
 ///
@@ -2100,6 +2107,85 @@ pub extern "C" fn lore_file_history(
 pub extern "C" fn lore_file_history_async(
     globals: &LoreGlobalArgs,
     args: &LoreFileHistoryArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
+pub type LoreFileAuditArgs = crate::file::LoreFileAuditArgs;
+
+/// Attribute each line of a file to the revision that last changed it.
+///
+/// One `LORE_EVENT_FILE_AUDIT` event carries each range of consecutive lines
+/// sharing an attribution. Each range arrives as soon as the step of the walk
+/// that resolves it ends. The walk resolves the most recently changed lines
+/// first, so ranges arrive in that order, not in line order. Each range is
+/// complete and never needs joining with another. A caller with what it needs
+/// may stop reading; the events already delivered stand.
+///
+/// A range names its revision and repository, not the revision's metadata. Read
+/// the metadata with `lore_revision_info`, once per distinct revision.
+///
+/// An error that ends the walk, such as a lost connection to the remote, ends
+/// the audit: every line is still delivered, those the walk did not reach with
+/// the outcome `LORE_FILE_AUDIT_OUTCOME_UNRESOLVED`, and `LORE_EVENT_COMPLETE`
+/// carries the error.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+///
+/// ## File Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_FILE_AUDIT` | `lore_file_audit_event_data_t` | Emitted for each range of consecutive lines sharing an attribution |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_file_audit(
+    globals: &LoreGlobalArgs,
+    args: &LoreFileAuditArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Asynchronous version of `lore_file_audit`.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+///
+/// ## File Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_FILE_AUDIT` | `lore_file_audit_event_data_t` | Emitted for each range of consecutive lines sharing an attribution |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_file_audit_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreFileAuditArgs,
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, dispatch_command);
@@ -4440,9 +4526,10 @@ pub type LoreRepositoryReleaseArgs = crate::repository::LoreRepositoryReleaseArg
 
 /// Release all cached store references for the given repository path.
 ///
-/// Frees in-memory store data and releases file-backed store cache entries.
-/// Any active repository contexts for this path remain valid, but once they
-/// are dropped the stores will be freed. Subsequent opens will create fresh stores.
+/// Frees cached in-memory store data. Disk-backed stores are not forced closed:
+/// each is released once nothing uses it, and a later open reuses one that is still
+/// alive, which the store epoch keeps current with what other processes wrote.
+/// Any active repository contexts for this path remain valid.
 ///
 /// # Events
 ///
@@ -6684,6 +6771,11 @@ pub type LoreStorageOpenArgs = crate::storage::open::LoreStorageOpenArgs;
 
 /// Open a content-addressed storage handle.
 ///
+/// A disk-backed handle claims its stores for this process until it is released, so
+/// another process using the same stores waits until then. The claim ends once the
+/// flush `lore_storage_close` starts has finished and every revision tree loaded
+/// against the handle has been closed.
+///
 /// # Events
 ///
 /// | Tag | Data Type | Description |
@@ -6894,7 +6986,12 @@ pub type LoreStorageCloseArgs = crate::storage::close::LoreStorageCloseArgs;
 ///
 /// Subsequent calls against the same handle return `InvalidArguments`.
 /// Close does not block on the flush it spawns — `Complete` fires after
-/// the in-flight counter drains, not after the flush finishes.
+/// the in-flight counter drains, not after the flush finishes. The handle's
+/// claim on its stores ends once that flush has finished and every revision
+/// tree loaded against the handle has been closed. With `LORE_STORE_RETAIN`
+/// set to `1` or `true`, a disk-backed handle's stores stay in memory without
+/// the claim for the window `store_keep_alive_seconds` gives, so a
+/// `lore_storage_open` of the same repository in that window reuses them.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_close(
     globals: &LoreGlobalArgs,
@@ -8092,6 +8189,9 @@ pub type LoreRevisionTreeLoadArgs = crate::revision_tree::load::LoreRevisionTree
 /// `(store, repository, revision_hash)` tuple. `revision_hash == 0` opens an
 /// empty tree suitable for committing an initial revision.
 ///
+/// The tree keeps the storage handle's claim on its stores for as long as it is
+/// open, past `lore_storage_close` on that handle.
+///
 /// | Terminal event                       | Payload                                | Notes                                              |
 /// |--------------------------------------|----------------------------------------|----------------------------------------------------|
 /// | `LORE_EVENT_REVISION_TREE_LOADED`    | `lore_revision_tree_loaded_event_data_t` | Emitted on success carrying the opened handle id |
@@ -8120,7 +8220,9 @@ pub type LoreRevisionTreeCloseArgs = crate::revision_tree::close::LoreRevisionTr
 ///
 /// Subsequent calls against the same handle return `InvalidArguments`. The
 /// call blocks until every in-flight op on the handle has paired its
-/// decrement.
+/// decrement. Closing a tree on a storage handle that is already closed
+/// flushes what the tree wrote since, and closing the last one releases
+/// what was keeping that handle's claim on its stores.
 ///
 /// | Terminal event                              | Payload                                       | Notes                                              |
 /// |---------------------------------------------|-----------------------------------------------|----------------------------------------------------|

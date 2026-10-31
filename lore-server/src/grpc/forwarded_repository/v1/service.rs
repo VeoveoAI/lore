@@ -20,7 +20,7 @@ use super::repository_get;
 use crate::auth::jwt::JwtVerifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_catalog::RepositoryCatalog;
-use crate::authnz::repository_catalog::resource_service_url;
+use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
@@ -36,10 +36,9 @@ impl InstrumentProvider for ForwardedRepositoryServiceInstrumentProvider {
 /// Mirrors particular RPCs of `LoreRepositoryV1Service`
 #[derive(Clone)]
 pub struct LoreForwardedRepositoryV1Service {
-    environment: EnvironmentConfig,
+    registry: RepositoryRegistry,
     jwt_verifier: Option<JwtVerifier>,
     authorizer: Arc<dyn RepositoryAuthorizer>,
-    repository_catalog: Arc<dyn RepositoryCatalog>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: Arc<HookDispatcher>,
@@ -61,21 +60,15 @@ impl LoreForwardedRepositoryV1Service {
     ) -> Self {
         let instrument_provider = ForwardedRepositoryServiceInstrumentProvider;
         Self {
-            environment,
+            registry: RepositoryRegistry::of_catalog(&environment, repository_catalog.as_ref()),
             jwt_verifier,
             authorizer,
-            repository_catalog,
             immutable_store,
             mutable_store,
             hook_dispatcher,
             rpc_timeout,
             instrument_provider,
         }
-    }
-
-    /// The auth service told of each repository created, if any.
-    fn auth_url(&self) -> Option<String> {
-        resource_service_url(&self.environment, self.repository_catalog.as_ref())
     }
 }
 
@@ -89,7 +82,7 @@ impl ForwardedRepositoryService for LoreForwardedRepositoryV1Service {
             self.rpc_timeout,
             repository_create::handler(
                 request,
-                self.auth_url(),
+                &self.registry,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.hook_dispatcher,

@@ -70,6 +70,13 @@ impl PostgresMutableStore {
 
 #[async_trait]
 impl MutableStore for PostgresMutableStore {
+    /// Nothing on disk to claim: the references are in PostgreSQL.
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
+        Ok(None)
+    }
+
     async fn load(
         self: Arc<Self>,
         partition: Partition,

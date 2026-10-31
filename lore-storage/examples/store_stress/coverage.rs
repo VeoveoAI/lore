@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! What a run exercised, so that a quiet run is not taken for coverage: which operations ran
-//! alongside which, what eviction and compaction reclaimed, the events the store logged, and the
-//! shapes the store reached.
+//! alongside which, which were dropped unfinished in which file operation, what eviction and
+//! compaction reclaimed, the events the store logged, and the shapes the store reached.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,14 +14,25 @@ use std::sync::atomic::Ordering;
 use lore_base::log::LoreLogLevel;
 use lore_storage::LocalImmutableStore;
 use lore_storage::gc_event::GcEventSink;
+use lore_storage::test_util::StoreTask;
 use parking_lot::Mutex;
 
 static LOG_EVENTS: LazyLock<Mutex<BTreeMap<String, u64>>> = LazyLock::new(Mutex::default);
 
+type RepairHook = Box<dyn Fn(&str, &str) + Send + Sync>;
+
+static REPAIR_HOOK: std::sync::OnceLock<RepairHook> = std::sync::OnceLock::new();
+
+/// Call `hook` with the violation class and the message of each repair, see [`REPAIRS`], the store
+/// logs from now on, as it logs it: a process stopped later still records it.
+pub fn on_repair(hook: impl Fn(&str, &str) + Send + Sync + 'static) {
+    let _ = REPAIR_HOOK.set(Box::new(hook));
+}
+
 /// The store events a run should reach, by the words of the message the store logs for each,
 /// numbers left out. Some are logged as the store sets out to do something, which their names
-/// say. The last two take a machine failure or a damaged file, so a gap there is expected.
-const MILESTONES: [(&str, &str); 15] = [
+/// say. The last three are repairs, see [`REPAIRS`].
+const MILESTONES: [(&str, &str); 16] = [
     ("compaction truncating a packfile", "truncating packfile"),
     (
         "compaction kept a referenced packfile",
@@ -64,11 +75,38 @@ const MILESTONES: [(&str, &str); 15] = [
     ("already obliterated", "already obliterated"),
     ("lost payload locations cleared", "Cleared "),
     ("corrupt bucket reset", "Resetting corrupt immutable bucket"),
+    (
+        "corrupt mutable bucket reset",
+        "Resetting corrupt mutable bucket",
+    ),
+];
+
+/// The milestones that are repairs of what only a machine losing writes or a damaged file leaves,
+/// which no run is expected to reach, each with the violation class reaching it is.
+pub const REPAIRS: [(&str, &str); 3] = [
+    (
+        "lost payload locations cleared",
+        "store-cleared-lost-payload-locations",
+    ),
+    ("corrupt bucket reset", "store-reset-a-corrupt-bucket"),
+    (
+        "corrupt mutable bucket reset",
+        "store-reset-a-corrupt-mutable-bucket",
+    ),
 ];
 
 fn log_callback(level: LoreLogLevel, _location: &str, message: &str) {
     if level < LoreLogLevel::Debug {
         return;
+    }
+    if let Some(hook) = REPAIR_HOOK.get()
+        && let Some((_, class)) = REPAIRS.iter().find(|(milestone, _)| {
+            MILESTONES
+                .iter()
+                .any(|(name, pattern)| name == milestone && message.contains(pattern.trim()))
+        })
+    {
+        hook(class, message);
     }
     // Messages differ by the numbers and hashes in them; the words name the event. Enough of
     // them to hold every milestone's pattern whole.
@@ -164,21 +202,56 @@ impl GcEventSink for PassCounts {
     }
 }
 
-/// Which operation kinds started while which others were running.
+/// Which operation kinds started while which others were running, and which were dropped
+/// unfinished while which file operations were in flight.
 pub struct Overlaps {
     names: Vec<&'static str>,
-    /// Kept for the life of the process, which the fault shim reads them for.
+    /// Kept for the life of the process, which the fault shim reads them for, and where the shim
+    /// keeps them, past it.
     running: &'static [AtomicUsize],
     counts: Vec<AtomicU64>,
+    cancelled: Mutex<BTreeMap<(usize, String), u64>>,
 }
 
 impl Overlaps {
+    /// Counts of the kinds `names` running, and after them of the tasks the store runs of its own
+    /// accord, which the store counts itself, see [`StoreTask`].
     pub fn new(names: Vec<&'static str>) -> Overlaps {
+        let names: Vec<&'static str> = names
+            .into_iter()
+            .chain(StoreTask::ALL.iter().map(|(_, name)| *name))
+            .collect();
         let kinds = names.len();
+        let running = crate::shim::counters(kinds)
+            .unwrap_or_else(|| Vec::leak((0..kinds).map(|_| AtomicUsize::new(0)).collect()));
+        lore_storage::test_util::count_store_tasks(&running[kinds - StoreTask::ALL.len()..]);
         Overlaps {
             names,
-            running: Vec::leak((0..kinds).map(|_| AtomicUsize::new(0)).collect()),
+            running,
             counts: (0..kinds * kinds).map(|_| AtomicU64::new(0)).collect(),
+            cancelled: Mutex::default(),
+        }
+    }
+
+    /// Record an operation of kind `kind` dropped unfinished, by each file operation in flight in
+    /// the process as it was: `no-file-op` for none, and `unattributed` without the fault shim to
+    /// ask.
+    pub fn cancelled(&self, kind: usize) {
+        let phases = match crate::shim::in_flight() {
+            Some(ops) if ops.is_empty() => vec!["no-file-op".to_string()],
+            Some(ops) => ops,
+            None => vec!["unattributed".to_string()],
+        };
+        let mut cancelled = self.cancelled.lock();
+        for phase in phases {
+            *cancelled.entry((kind, phase)).or_default() += 1;
+        }
+    }
+
+    /// Print the operations dropped unfinished, by kind and file operation in flight.
+    pub fn report_cancelled(&self) {
+        for ((kind, phase), count) in self.cancelled.lock().iter() {
+            println!("COVERAGE cancel {} {phase} {count}", self.names[*kind]);
         }
     }
 
@@ -308,26 +381,31 @@ impl Shapes {
     }
 }
 
+/// How many times the store logged `milestone`, one of [`MILESTONES`], since [`capture_logs`].
+pub fn reached(milestone: &str) -> u64 {
+    let Some((_, pattern)) = MILESTONES.iter().find(|(name, _)| *name == milestone) else {
+        return 0;
+    };
+    LOG_EVENTS
+        .lock()
+        .iter()
+        .filter(|(event, _)| event.contains(pattern.trim()))
+        .map(|(_, count)| count)
+        .sum()
+}
+
 /// Print the store's logged events and which milestones the run reached.
 pub fn report_logs() -> Vec<String> {
-    let events = LOG_EVENTS.lock();
     println!("  store events:");
-    for (event, count) in events.iter() {
+    for (event, count) in LOG_EVENTS.lock().iter() {
         println!("    {count:>8} x {event}");
     }
     let mut missing = vec![];
-    for (milestone, pattern) in MILESTONES {
-        let reached: u64 = events
-            .iter()
-            .filter(|(event, _)| event.contains(pattern.trim()))
-            .map(|(_, count)| count)
-            .sum();
+    for (milestone, _) in MILESTONES {
+        let reached = reached(milestone);
         println!("COVERAGE event {} {reached}", milestone.replace(' ', "-"));
-        let needs_machine_failure = matches!(
-            milestone,
-            "lost payload locations cleared" | "corrupt bucket reset"
-        );
-        if reached == 0 && !needs_machine_failure {
+        let repair = REPAIRS.iter().any(|(name, _)| *name == milestone);
+        if reached == 0 && !repair {
             missing.push(milestone.to_string());
         }
     }

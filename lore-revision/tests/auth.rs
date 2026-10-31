@@ -46,8 +46,6 @@ mod tests {
         fn make_jwt_with_audience(audience: Vec<String>) -> JWTUserInfo {
             JWTUserInfo {
                 issuer: "my_test_issuer.example.com".to_string(),
-                azp: None,
-                client_id: None,
                 user_id: "my_user_id".into(),
                 identity: None,
                 identity_namespaced: None,

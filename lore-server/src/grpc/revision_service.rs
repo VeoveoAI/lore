@@ -121,6 +121,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_create::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
@@ -139,6 +140,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_delete::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
@@ -202,6 +204,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_push::handler(
                 request,
+                self.repository_authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
@@ -315,6 +318,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_protect::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -345,6 +349,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_metadata_set::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -360,6 +365,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_unprotect::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),

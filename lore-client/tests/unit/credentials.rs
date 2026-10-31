@@ -3,7 +3,6 @@
 use std::ffi::OsString;
 
 use clap::Parser;
-use lore_client::cli::ACCESS_TOKEN_VAR;
 use lore_client::cli::IDENTITY_VAR;
 use lore_client::cli::LoreCli;
 use lore_client::cli::LoreCliError;
@@ -14,7 +13,7 @@ fn env(value: &str) -> Option<OsString> {
 }
 
 fn resolve(flag: Option<&str>, from_env: Option<OsString>) -> Option<String> {
-    resolve_credential(flag, from_env, ACCESS_TOKEN_VAR).expect("resolves")
+    resolve_credential(flag, from_env, IDENTITY_VAR).expect("resolves")
 }
 
 /// The flag outranks the variable, which stands in only for a flag that was
@@ -43,10 +42,10 @@ fn empty_values_count_as_absent() {
     assert_eq!(resolve(None, env("  ")), None);
 }
 
-/// A token is passed on as given; only a blank value reads as unset.
+/// A value is passed on as given; only a blank value reads as unset.
 #[test]
 fn the_variable_is_not_trimmed() {
-    assert_eq!(resolve(None, env("token ")), Some("token ".to_string()));
+    assert_eq!(resolve(None, env("person ")), Some("person ".to_string()));
 }
 
 #[cfg(unix)]

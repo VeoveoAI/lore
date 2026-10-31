@@ -70,27 +70,52 @@ fn per_service_overrides_are_independent() {
     assert_eq!(env.notification_url(FALLBACK), FALLBACK);
 }
 
-/// Uses `auth_url` as fallback user directory, unless
-/// `user_url` is defined
-#[test]
-fn user_url_follows_the_auth_url_until_advertised() {
-    const AUTH_URL: &str = "ucs-auth://auth.example.com";
+mod items_from {
+    use bytes::Bytes;
+    use lore_base::types::Hash;
 
-    assert_eq!(env_with(Endpoint::default()).user_url(AUTH_URL), AUTH_URL);
-    assert_eq!(
-        env_with(Endpoint {
-            user_url: Some(String::new()),
-            ..Default::default()
-        })
-        .user_url(AUTH_URL),
-        AUTH_URL
-    );
-    assert_eq!(
-        env_with(Endpoint {
-            user_url: Some("ucs-auth://directory.example.com".into()),
-            ..Default::default()
-        })
-        .user_url(AUTH_URL),
-        "ucs-auth://directory.example.com"
-    );
+    use super::*;
+
+    fn page(numbers: &[u8]) -> RevisionListResponse {
+        RevisionListResponse {
+            items: numbers
+                .iter()
+                .map(|&number| RevisionItem {
+                    number: u64::from(number),
+                    signature: Hash::from([number; 32]),
+                    metadata: Hash::default(),
+                    state: Bytes::new(),
+                })
+                .collect(),
+            next_revision: Hash::default(),
+            previous_revision: Hash::default(),
+        }
+    }
+
+    fn numbers(items: &[RevisionItem]) -> Vec<u64> {
+        items.iter().map(|item| item.number).collect()
+    }
+
+    #[test]
+    fn a_page_starting_at_its_anchor_is_kept_whole() {
+        assert_eq!(
+            numbers(page(&[3, 2, 1]).items_from(Hash::from([3; 32]))),
+            [3, 2, 1]
+        );
+    }
+
+    /// The revisions above the anchor in a page aligned on a wider boundary are not its
+    /// ancestors.
+    #[test]
+    fn a_page_starting_above_its_anchor_loses_the_revisions_above_it() {
+        assert_eq!(
+            numbers(page(&[6, 5, 4, 3, 2, 1]).items_from(Hash::from([3; 32]))),
+            [3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn a_page_not_holding_its_anchor_holds_nothing_from_it() {
+        assert!(page(&[6, 5, 4]).items_from(Hash::from([3; 32])).is_empty());
+    }
 }

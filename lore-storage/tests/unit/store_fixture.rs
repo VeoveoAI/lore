@@ -19,6 +19,7 @@ use lore_storage::immutable_store::StoreError;
 use lore_storage::local::immutable_store::CompactionInstruments;
 use lore_storage::local::immutable_store::ImmutableStoreEntry;
 use lore_storage::local::immutable_store::LocalImmutableStore;
+use lore_storage::local::store_lock::Intent;
 
 /// `count` payloads of 4 KiB whose hashes all fall in one group, and that group's index.
 pub(crate) fn payloads_in_one_group(count: usize) -> (usize, Vec<Vec<u8>>) {
@@ -136,6 +137,17 @@ pub(crate) async fn wait_until<T>(condition: impl Fn() -> bool, task: &tokio::ta
     panic!("the condition never held");
 }
 
+/// Wait until `condition` holds, failing with `failure` after 10 s.
+pub(crate) async fn wait_for(condition: impl AsyncFn() -> bool, failure: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !condition().await {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect(failure);
+}
+
 /// Assert that each of `payloads`, an address and the bytes stored under it, reads back from
 /// `store`.
 pub(crate) async fn assert_payloads_read_back(
@@ -167,13 +179,15 @@ pub(crate) async fn compact_group_toward(
         .unwrap()
 }
 
-/// As [`compact_group_toward`], returning the error that ended a rewrite.
+/// As [`compact_group_toward`], returning the error that ended a rewrite. The group is compacted
+/// under a write claim, as a compaction pass compacts it.
 pub(crate) async fn try_compact_group_toward(
     store: &Arc<LocalImmutableStore>,
     group_index: usize,
     target_size: usize,
     protect_local_fragment: bool,
 ) -> Result<bool, StoreError> {
+    let _claim = store.hold(Intent::Write).await?;
     store
         .clone()
         .compact_group_packfiles(

@@ -17,14 +17,14 @@ use super::handlers::repository_metadata_set;
 use super::handlers::repository_query;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_catalog::RepositoryCatalog;
-use crate::authnz::repository_catalog::resource_service_url;
+use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 use crate::legacy::rpc::repository_service_server::RepositoryService;
 
 #[derive(Clone)]
 pub struct LoreRepositoryService {
-    environment: EnvironmentConfig,
+    registry: RepositoryRegistry,
     authorizer: Arc<dyn RepositoryAuthorizer>,
     repository_catalog: Arc<dyn RepositoryCatalog>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
@@ -50,7 +50,7 @@ impl LoreRepositoryService {
         rpc_timeout: Duration,
     ) -> Self {
         Self {
-            environment,
+            registry: RepositoryRegistry::of_catalog(&environment, repository_catalog.as_ref()),
             authorizer,
             repository_catalog,
             immutable_store,
@@ -71,7 +71,7 @@ impl RepositoryService for LoreRepositoryService {
             self.rpc_timeout,
             repository_create::handler(
                 request,
-                resource_service_url(&self.environment, self.repository_catalog.as_ref()),
+                &self.registry,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.hook_dispatcher,
@@ -89,7 +89,8 @@ impl RepositoryService for LoreRepositoryService {
             self.rpc_timeout,
             repository_delete::handler(
                 request,
-                resource_service_url(&self.environment, self.repository_catalog.as_ref()),
+                &self.registry,
+                &self.authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self,

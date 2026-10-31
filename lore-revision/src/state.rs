@@ -7369,7 +7369,7 @@ pub fn file_modified_against_node<'a>(
 #[must_use]
 #[lore_macro::test_pub]
 pub struct RecordedModifiedTimes {
-    entries: Box<crossbeam::queue::SegQueue<(Hash, u64)>>,
+    entries: Box<crossbeam_queue::SegQueue<(Hash, u64)>>,
     /// Times at or after this are not collected.
     floor: u64,
 }
@@ -7437,11 +7437,14 @@ impl RecordedModifiedTimes {
             if items.is_empty() {
                 continue;
             }
+            // Each task holds the context, and with it the command's claims on the store, so
+            // that none outlives them when this is dropped part way and its tasks run on to
+            // their next await.
             lore_spawn!(tasks, {
                 let store = store.clone();
-                let partition = repository.root_id();
+                let repository = repository.clone();
                 async move {
-                    file_modified_time_store_group(store, partition, items).await;
+                    file_modified_time_store_group(store, repository.root_id(), items).await;
                 }
             });
         }
@@ -7576,7 +7579,7 @@ pub async fn wait_until_settled(repository: &RepositoryContext, mtime_max: u64) 
     let _ = tokio::time::timeout(MODIFIED_TIME_SETTLE_LIMIT, async {
         while stamp_probe(&path)
             .await
-            .is_none_or(|stamp| stamp <= mtime_max)
+            .is_none_or(|stamp| mtime_max >= stamp)
         {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }

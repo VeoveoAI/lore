@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Resolves the access token and identity through the real `LORE_ACCESS_TOKEN`
-//! and `LORE_IDENTITY` variables, which are process-wide state, so this runs in
-//! a process of its own.
+//! Resolves the access token, identity token and identity through the real
+//! `LORE_ACCESS_TOKEN`, `LORE_IDENTITY_TOKEN` and `LORE_IDENTITY` variables, which
+//! are process-wide state, so this runs in a process of its own.
 use clap::Parser;
 use lore::interface::LoreGlobalArgs;
 use lore_client::cli::LoreCli;
@@ -24,6 +24,7 @@ fn the_variables_stand_in_for_absent_flags() {
     unsafe {
         std::env::remove_var("LORE_ACCESS_TOKEN");
         std::env::remove_var("LORE_IDENTITY");
+        std::env::remove_var("LORE_IDENTITY_TOKEN");
     }
     let unset = globals(&["lore", "status"]);
     assert_eq!(unset.access_token(), "", "nothing set is no token");
@@ -74,6 +75,33 @@ fn the_variables_stand_in_for_absent_flags() {
         None,
         "an identity token names its own identity, so the variable does not apply"
     );
+
+    let with_explicit_identity = globals(&["lore", "status", "--identity", "flag-identity"]);
+    assert_eq!(
+        with_explicit_identity.access_token(),
+        OPAQUE,
+        "an explicit identity keeps the opaque token from the variable"
+    );
+
+    unsafe { std::env::set_var("LORE_IDENTITY_TOKEN", "identity-token") };
+    let with_identity_token_variable = globals(&["lore", "status"]);
+    assert_eq!(
+        with_identity_token_variable.identity_token(),
+        "identity-token",
+        "the variable sets the identity token"
+    );
+    assert_eq!(
+        with_identity_token_variable.identity(),
+        None,
+        "an identity token from its variable names its own identity too"
+    );
+    let identity_outranks = globals(&["lore", "status", "--identity", "flag-identity"]);
+    assert_eq!(
+        identity_outranks.identity_token(),
+        "",
+        "an explicit identity outranks the identity token variable"
+    );
+    unsafe { std::env::remove_var("LORE_IDENTITY_TOKEN") };
 
     unsafe { std::env::set_var("LORE_IDENTITY", "") };
     let mut without_identity = globals(&["lore", "status"]);

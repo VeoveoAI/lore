@@ -10,5 +10,6 @@ mod auth_mode;
 mod client_main;
 mod commands;
 mod credentials;
+mod secrets;
 mod stats_display;
 mod util;

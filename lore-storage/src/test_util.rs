@@ -4,11 +4,15 @@
 //! `test-util`, so a test can count the decodes, hashes and fetches a read costs, answer a remote
 //! fetch without a remote, order what concurrent reads, stores and compactions do, fail packfile
 //! opens, writes, syncs and metadata reads and store directory stats or keep writes in flight,
-//! interrupt a payload gate hold, and hold a read's memory past the read.
+//! interrupt a payload gate hold, hold a read's memory past the read, and count the tasks the store
+//! runs of its own accord.
 
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use tokio::sync::Notify;
@@ -33,7 +37,8 @@ thread_local! {
     static FAILED_STATS: Cell<usize> = const { Cell::new(0) };
     static FAILED_OPENS: Cell<usize> = const { Cell::new(0) };
     static FAILED_DIRECTORY_STATS: Cell<usize> = const { Cell::new(0) };
-    static IN_FLIGHT: RefCell<Option<Arc<InFlight>>> = const { RefCell::new(None) };
+    static PACKFILE_IN_FLIGHT: RefCell<Option<Arc<InFlight>>> = const { RefCell::new(None) };
+    static STORE_WRITE_IN_FLIGHT: RefCell<Option<Arc<InFlight>>> = const { RefCell::new(None) };
     static HOLD_INTERRUPT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static PACKFILE_SIZE_LIMIT: Cell<u64> = const { Cell::new(0) };
 }
@@ -42,7 +47,7 @@ tokio::task_local! {
     static UNVALIDATED_PUTS: ();
 }
 
-/// A point where [`pause_at`] holds a store, a read or a compaction.
+/// A point where [`pause_at`] holds a store, a read, a list, a flush or a compaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PausePoint {
     /// A packfile write has reserved its range and not yet written it.
@@ -62,6 +67,98 @@ pub enum PausePoint {
     /// A fan-out commit's `level.pending` is on disk, and the write has not yet returned to the
     /// commit.
     Committing,
+    /// A size eviction is about to check for a stop or a fan-out and evict from its next bucket.
+    Evicting,
+    /// An epoch advance has written the epoch and not yet recorded it as the directory's current
+    /// one.
+    Advanced,
+    /// A flush is about to try a group's flush lock, under which it reads whether the group has
+    /// anything to write.
+    Scanning,
+    /// A mutable store list has handed its stream back, and one of its producers, which read its
+    /// group's buckets into memory before, has sent none of their keys yet, and holds no lock of
+    /// its group.
+    Listing,
+    /// A mutable store list producer walking its group under the group's layout has sent the keys
+    /// of a bucket and not yet read the next.
+    Walking,
+    /// A measurement of the packstores' size holds the claim it runs on and has measured none
+    /// yet.
+    Measuring,
+    /// A put that verifies its writes has stored its entry and not yet found it again to read its
+    /// payload back.
+    Verifying,
+    /// A verification of the immutable store holds a group's flush lock, has read the group's
+    /// bucket count, and has checked none of its buckets.
+    Checking,
+}
+
+/// A task the store runs of its own accord rather than for a caller, see [`count_store_tasks`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreTask {
+    /// A group's delayed flush in the immutable store.
+    DelayedFlush,
+    /// A group's delayed flush in the mutable store.
+    MutableDelayedFlush,
+    /// A pass of the periodic evictor.
+    Evictor,
+    /// A step of the periodic compactor.
+    Compactor,
+    /// An eviction then compaction pass run as one, as a load crossing a cap fires.
+    GcPass,
+}
+
+impl StoreTask {
+    /// Every task, in the order [`count_store_tasks`] counts them, with its name.
+    pub const ALL: [(StoreTask, &'static str); 5] = [
+        (StoreTask::DelayedFlush, "delayed-flush"),
+        (StoreTask::MutableDelayedFlush, "mutable-delayed-flush"),
+        (StoreTask::Evictor, "evictor"),
+        (StoreTask::Compactor, "compactor"),
+        (StoreTask::GcPass, "gc-pass"),
+    ];
+}
+
+static STORE_TASKS: OnceLock<&'static [AtomicUsize]> = OnceLock::new();
+
+static EVICTOR_FLOOR: AtomicUsize = AtomicUsize::new(0);
+
+/// Makes the periodic evictor enforce capacities down to `floor` fragments in this process,
+/// rather than raising any capacity below its floor to the floor, so that a test's small stores
+/// meet its passes.
+pub fn lower_evictor_floor(floor: usize) {
+    EVICTOR_FLOOR.store(floor.max(1), Ordering::Relaxed);
+}
+
+/// The floor the periodic evictor raises a capacity to: the one [`lower_evictor_floor`] set, or
+/// `default`.
+pub(crate) fn evictor_floor(default: usize) -> usize {
+    match EVICTOR_FLOOR.load(Ordering::Relaxed) {
+        0 => default,
+        floor => floor,
+    }
+}
+
+/// Counts each [`StoreTask`] running in `counters`, one per task in the order of
+/// [`StoreTask::ALL`], from now on in this process.
+pub fn count_store_tasks(counters: &'static [AtomicUsize]) {
+    let _ = STORE_TASKS.set(counters);
+}
+
+/// Counts `task` as running until the returned guard drops, where [`count_store_tasks`] asked.
+pub(crate) fn store_task(task: StoreTask) -> Option<StoreTaskRunning> {
+    let counter = STORE_TASKS.get()?.get(task as usize)?;
+    counter.fetch_add(1, Ordering::Relaxed);
+    Some(StoreTaskRunning(counter))
+}
+
+/// A [`StoreTask`] counted as running, until dropped.
+pub(crate) struct StoreTaskRunning(&'static AtomicUsize);
+
+impl Drop for StoreTaskRunning {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A hold armed at a [`PausePoint`]: `reached` is notified when a task arrives there, which then
@@ -73,7 +170,7 @@ pub struct Pause {
 }
 
 /// Holds the next task on this thread to reach `point` there until the returned pause is resumed.
-/// Only that one task is held.
+/// Only that one task is held. Pauses armed at one point are taken in the order they were armed.
 pub fn pause_at(point: PausePoint) -> Arc<Pause> {
     let pause = Arc::new(Pause::default());
     PAUSES.with(|pauses| pauses.borrow_mut().push((point, pause.clone())));
@@ -85,7 +182,7 @@ pub(crate) async fn pause_point(point: PausePoint) {
     let pause = PAUSES.with(|pauses| {
         let mut pauses = pauses.borrow_mut();
         let position = pauses.iter().position(|(armed, _)| *armed == point)?;
-        Some(pauses.swap_remove(position).1)
+        Some(pauses.remove(position).1)
     });
     if let Some(pause) = pause {
         pause.reached.notify_one();
@@ -168,38 +265,111 @@ pub(crate) fn packfile_size_limit() -> Option<u64> {
     PACKFILE_SIZE_LIMIT.with(|size| Some(size.get()).filter(|limit| *limit != 0))
 }
 
-/// A packfile write [`hold_packfile_write`] keeps in flight: it never completes, and the buffer it
-/// was issued with is kept until [`InFlight::complete`], as a driver keeps it until the kernel is
-/// done with the write. `issued` is notified once the write is issued.
+/// A write [`hold_packfile_write`] or [`hold_store_write`] keeps in flight: it lands only at
+/// [`InFlight::complete`], and until then what it was issued with, a packfile write's buffer or
+/// another write's completion, is kept, as a driver keeps it until the kernel is done with the
+/// write. A task still awaiting the write then goes on with it, as it would once the driver answers;
+/// one dropped before it goes on leaves what was kept to be dropped once the write has landed, as
+/// the driver drops it. `issued` is notified once the write is issued.
 #[derive(Default)]
 pub struct InFlight {
     pub issued: Notify,
-    buffer: parking_lot::Mutex<Option<Box<dyn std::any::Any + Send>>>,
+    landed: Notify,
+    parked: parking_lot::Mutex<Parked>,
+}
+
+/// What an [`InFlight`] write was issued with, and whether it has landed and is awaited, under one
+/// lock, so that whichever of its landing and the drop of the task awaiting it comes second drops
+/// what was kept.
+#[derive(Default)]
+struct Parked {
+    kept: Option<Box<dyn std::any::Any + Send>>,
+    landed: bool,
+    awaited: bool,
 }
 
 impl InFlight {
-    /// Drops the buffer the write was issued with, as the driver does once the write completes.
+    /// Lands the write: a task awaiting it goes on with what it was issued with, and with none,
+    /// that is dropped as the driver drops it once the write completes.
     pub fn complete(&self) {
-        drop(self.buffer.lock().take());
+        let mut parked = self.parked.lock();
+        parked.landed = true;
+        if parked.awaited {
+            self.landed.notify_one();
+        } else {
+            let kept = parked.kept.take();
+            drop(parked);
+            drop(kept);
+        }
+    }
+
+    /// Keeps `kept` and parks the write until it lands, handing `kept` back if it is a `T`.
+    async fn park<T: 'static>(&self, kept: Box<dyn std::any::Any + Send>) -> Option<T> {
+        struct Awaiting<'a>(&'a parking_lot::Mutex<Parked>);
+        impl Drop for Awaiting<'_> {
+            fn drop(&mut self) {
+                let mut parked = self.0.lock();
+                parked.awaited = false;
+                let kept = if parked.landed {
+                    parked.kept.take()
+                } else {
+                    None
+                };
+                drop(parked);
+                drop(kept);
+            }
+        }
+        {
+            let mut parked = self.parked.lock();
+            parked.kept = Some(kept);
+            parked.awaited = true;
+        }
+        let _awaiting = Awaiting(&self.parked);
+        self.issued.notify_one();
+        self.landed.notified().await;
+        let kept = self.parked.lock().kept.take()?;
+        kept.downcast().ok().map(|kept| *kept)
     }
 }
 
 /// Keeps the next packfile write on this thread in flight, see [`InFlight`].
 pub fn hold_packfile_write() -> Arc<InFlight> {
+    hold_write(&PACKFILE_IN_FLIGHT)
+}
+
+/// Keeps the next bucket, level file, truncate or epoch write on this thread in flight, see
+/// [`InFlight`].
+pub fn hold_store_write() -> Arc<InFlight> {
+    hold_write(&STORE_WRITE_IN_FLIGHT)
+}
+
+/// Arms `held` on this thread with a new [`InFlight`].
+fn hold_write(
+    held: &'static std::thread::LocalKey<RefCell<Option<Arc<InFlight>>>>,
+) -> Arc<InFlight> {
     let in_flight = Arc::new(InFlight::default());
-    IN_FLIGHT.with(|held| *held.borrow_mut() = Some(in_flight.clone()));
+    held.with(|held| *held.borrow_mut() = Some(in_flight.clone()));
     in_flight
 }
 
-/// Parks this packfile write for good, keeping a copy of `buffer` in the [`InFlight`] that
+/// Parks this packfile write until it lands, keeping a copy of `buffer` in the [`InFlight`] that
 /// [`hold_packfile_write`] armed on this thread, if any.
 pub(crate) async fn park_packfile_write<B: Clone + Send + 'static>(buffer: &B) {
-    let Some(in_flight) = IN_FLIGHT.with(|held| held.borrow_mut().take()) else {
-        return;
-    };
-    *in_flight.buffer.lock() = Some(Box::new(buffer.clone()));
-    in_flight.issued.notify_one();
-    std::future::pending::<()>().await;
+    if let Some(in_flight) = PACKFILE_IN_FLIGHT.with(|held| held.borrow_mut().take()) {
+        in_flight.park::<()>(Box::new(buffer.clone())).await;
+    }
+}
+
+/// Parks this write until it lands, keeping `completion` in the [`InFlight`] that
+/// [`hold_store_write`] armed on this thread, if any, and hands it back.
+pub(crate) async fn park_store_write<C: Send + 'static>(completion: C) -> C {
+    match STORE_WRITE_IN_FLIGHT.with(|held| held.borrow_mut().take()) {
+        Some(in_flight) => in_flight
+            .park(Box::new(completion))
+            .await
+            .expect("a landed write's completion is handed back"),
+        None => completion,
+    }
 }
 
 /// Runs `puts`, letting the puts it makes store fragments that pass only the size checks, for
@@ -381,6 +551,26 @@ impl HoldingStore {
 
 #[async_trait::async_trait]
 impl crate::immutable_store::ImmutableStore for HoldingStore {
+    /// Joins the claim of the store this one wraps.
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<crate::local::store_lock::StoreGuard>, crate::immutable_store::StoreError>
+    {
+        self.inner.clone().hold_for_command().await
+    }
+
+    fn store_lock(&self) -> Option<Arc<crate::local::store_lock::StoreLock>> {
+        self.inner.store_lock()
+    }
+
+    /// Joins the task claim of the store this one wraps.
+    async fn hold_for_task(
+        self: Arc<Self>,
+    ) -> Result<Option<crate::local::store_lock::StoreGuard>, crate::immutable_store::StoreError>
+    {
+        self.inner.clone().hold_for_task().await
+    }
+
     async fn get(
         self: Arc<Self>,
         partition: crate::types::Partition,

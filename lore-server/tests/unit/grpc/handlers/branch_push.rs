@@ -225,7 +225,7 @@ async fn push_linear_revisions(
             repository.clone(),
             branch,
             state.revision(),
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             DEFAULT_HISTORY_STEP_SIZE,
@@ -269,7 +269,7 @@ async fn push_jump_revision(
         repository.clone(),
         branch,
         state.revision(),
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
@@ -425,7 +425,7 @@ mod push {
                 repository_context,
                 branch_id,
                 nonexistent_revision,
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -475,7 +475,7 @@ mod push {
                 repository,
                 branch,
                 state.revision(),
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -537,7 +537,7 @@ mod push {
                 repository,
                 branch,
                 state.revision(),
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -600,7 +600,7 @@ mod push {
                 repository,
                 branch,
                 merge.revision(),
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -671,7 +671,7 @@ mod push {
                 repository,
                 branch,
                 merge.revision(),
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -1009,5 +1009,156 @@ mod collect_new_addresses {
             assert!(error.is_address_not_found(), "{error:?}");
         }))
         .await;
+    }
+}
+
+mod push_protected_action {
+    use lore_base::types::Hash;
+    use lore_server::hooks::HookDispatcher;
+    use lore_telemetry::InstrumentProvider;
+    use lore_transport::grpc::REPOSITORY_ID_KEY;
+    use opentelemetry::KeyValue;
+
+    use super::*;
+    use crate::grpc::push_protected::PUSH_PROTECTED;
+    use crate::grpc::push_protected::TIERS;
+    use crate::grpc::push_protected::Tier;
+    use crate::notification::testing::MockNotificationSender;
+
+    struct TestInstrumentProvider;
+
+    impl InstrumentProvider for TestInstrumentProvider {
+        fn namespace(&self) -> &'static str {
+            "test"
+        }
+        fn labels(&self) -> &[KeyValue] {
+            &[]
+        }
+    }
+
+    async fn push_to_protected_branch(
+        tier: Tier,
+        actions: &'static [&'static str],
+        service_account: bool,
+    ) -> Result<(), tonic::Status> {
+        push_to_branch(tier, actions, service_account, true).await
+    }
+
+    async fn push_to_branch(
+        tier: Tier,
+        actions: &'static [&'static str],
+        service_account: bool,
+        protected: bool,
+    ) -> Result<(), tonic::Status> {
+        let repository_id = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let mut notification_sender = MockNotificationSender::new();
+        notification_sender
+            .expect_branch_pushed()
+            .returning(|_, _, _, _, _| ());
+        let notification_sender = Arc::new(notification_sender);
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+            ));
+            let main = create_test_branch(&repository).await;
+            if protected {
+                branch::protect(repository.clone(), main)
+                    .await
+                    .expect("should protect");
+            }
+            let state =
+                serialize_revision(&repository, main, Hash::default(), Hash::default(), 1).await;
+
+            let mut request = tonic::Request::new(lore_proto::BranchPushRequest {
+                branch: main.into(),
+                revision: state.revision().into(),
+                force: false,
+                fast_forward_merge: false,
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository_id.data()),
+            );
+            let mut request = tier.with_token(request, repository_id, actions);
+            if service_account {
+                // Replaces the claims with a token whose only privilege is the removed claim.
+                request
+                    .extensions_mut()
+                    .insert(lore_server::auth::jwt::AuthorizationToken {
+                        user_id: "service-bot".into(),
+                        is_service_account: Some(true),
+                        ..Default::default()
+                    });
+            }
+
+            let hook_dispatcher = HookDispatcher::empty();
+            handler(
+                request,
+                tier.authorizer(),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+                &TestInstrumentProvider,
+            )
+            .await
+            .map(|_| ())
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_action_bypasses_protection() {
+        for tier in TIERS {
+            push_to_protected_branch(tier, &[PUSH_PROTECTED], false)
+                .await
+                .unwrap_or_else(|err| panic!("{tier:?}: holder of the action should push: {err}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn without_the_action_a_protected_branch_is_denied() {
+        for tier in TIERS {
+            let err = push_to_protected_branch(tier, &["read", "write"], false)
+                .await
+                .expect_err("a caller without the action must not push");
+            assert_eq!(err.code(), Code::PermissionDenied, "{tier:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_service_account_claim_no_longer_bypasses_protection() {
+        for tier in TIERS {
+            let err = push_to_protected_branch(tier, &[], true)
+                .await
+                .expect_err("the claim alone must not waive protection");
+            assert_eq!(err.code(), Code::PermissionDenied, "{tier:?}");
+        }
+    }
+
+    /// An unprotected branch needs `write`, and only `write`: `push-protected`
+    /// answers for protected branches. Tier 1 is left out, since it grants
+    /// `write` to every token.
+    #[tokio::test]
+    async fn an_unprotected_branch_needs_write() {
+        for tier in [Tier::Resource, Tier::AuthClient] {
+            push_to_branch(tier, &["write"], false, false)
+                .await
+                .unwrap_or_else(|err| panic!("{tier:?}: `write` should push: {err}"));
+            for actions in [&["read"][..], &[PUSH_PROTECTED][..]] {
+                let err = push_to_branch(tier, actions, false, false)
+                    .await
+                    .expect_err("an unprotected push needs `write`");
+                assert_eq!(err.code(), Code::PermissionDenied, "{tier:?} {actions:?}");
+            }
+        }
     }
 }

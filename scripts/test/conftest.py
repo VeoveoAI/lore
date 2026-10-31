@@ -29,9 +29,9 @@ from lore_server import (
 from service_util import (
     LORE_SERVICE_LISTENING_MESSAGE,
     LORE_SERVICE_SOCKET_VAR,
-    service_claim_path,
     LORE_TEST_SERVICE_SOCKET_VAR,
     LORE_TEST_SHARED_SERVICE_VAR,
+    remove_service_claim,
     service_supported,
     stop_lore_service,
 )
@@ -367,6 +367,13 @@ class TrackedServices:
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 **ends_with_launcher(),
+                # A group of its own on Windows, so that a console signal sent to
+                # the service reaches it alone rather than the test run as well.
+                **(
+                    {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                    if sys.platform == "win32"
+                    else {}
+                ),
             )
         # Tracked before any wait, so that a service which fails to become ready
         # is still ended when the test does rather than outliving the run.
@@ -459,8 +466,7 @@ def lore_service_socket():
     yield socket_name
 
     del os.environ[LORE_SERVICE_SOCKET_VAR]
-    if hasattr(os, "getuid"):
-        service_claim_path(socket_name).unlink(missing_ok=True)
+    remove_service_claim(socket_name)
 
 
 @pytest.fixture(autouse=True)
@@ -887,10 +893,7 @@ def _start_shared_service(config):
     env = lore_test_env(service_dir)
     env[LORE_SERVICE_SOCKET_VAR] = socket_name
     services = TrackedServices(_lore_executable_path(config), env, service_dir)
-    if hasattr(os, "getuid"):
-        config.add_cleanup(
-            lambda: service_claim_path(socket_name).unlink(missing_ok=True)
-        )
+    config.add_cleanup(lambda: remove_service_claim(socket_name))
     config.add_cleanup(services.terminate_all)
     services.start(service_dir)
     os.environ[LORE_TEST_SERVICE_SOCKET_VAR] = socket_name

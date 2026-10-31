@@ -22,6 +22,7 @@ use crate::auth;
 use crate::auth::AuthEndpoint;
 use crate::auth::AuthMode;
 use crate::auth::exchange::auth_exchange;
+use crate::auth::user_directory::UserDirectory;
 use crate::error::ProtocolError;
 use crate::grpc;
 use crate::quic;
@@ -303,6 +304,42 @@ pub fn parse(remote_url: &str) -> Result<(Url, Arc<dyn Protocol>), ProtocolError
     Ok((parsed_url, protocol))
 }
 
+/// Whether a connection to `url` authenticates the server, which it does when the scheme ends in
+/// `s`: QUIC then validates the server certificate and gRPC uses TLS.
+pub(crate) fn authenticates_server(url: &Url) -> bool {
+    url.scheme().ends_with('s')
+}
+
+/// Refuses an `environment` that advertises a storage, revision, lock, repository or notification
+/// endpoint that does not authenticate the server when `remote_url` does.
+#[lore_macro::test_pub]
+fn check_advertised_endpoints(
+    remote_url: &Url,
+    environment: &EnvironmentConfig,
+) -> Result<(), ProtocolError> {
+    if !authenticates_server(remote_url) {
+        return Ok(());
+    }
+    let remote = remote_url.as_str();
+    for (service, url) in [
+        ("storage", environment.storage_url(remote)),
+        ("revision", environment.revision_url(remote)),
+        ("lock", environment.lock_url(remote)),
+        ("repository", environment.repository_url(remote)),
+        ("notification", environment.notification_url(remote)),
+    ] {
+        if url != remote && !Url::parse(url).is_ok_and(|url| authenticates_server(&url)) {
+            return Err(ProtocolError::from(lore_base::error::NotSupported {
+                operation: format!(
+                    "connecting to the {service} endpoint {url} advertised by {remote_url}, which \
+                     does not authenticate the server"
+                ),
+            }));
+        }
+    }
+    Ok(())
+}
+
 /// Whether a failed `session_start` settles the question for this connection's identity, so asking
 /// again before the identity changes is a round trip that can only fail the same way.
 ///
@@ -396,6 +433,7 @@ async fn connect_impl(
         .await
         .forward::<ProtocolError>("failed to get environment config")?;
     lore_debug!("Server environment config from {remote_url}: {environment:?}");
+    check_advertised_endpoints(&remote_url, &environment)?;
 
     let auth_endpoint = auth::authentication::select(auth_mode, &environment)
         .forward::<ProtocolError>("selecting the authentication path")?
@@ -1018,6 +1056,16 @@ impl Connection {
         connection
     }
 
+    /// A [`detached`](Self::detached) connection reaching no storage, whose revision service
+    /// for `repository` is `revision`.
+    #[cfg(feature = "test-util")]
+    pub fn detached_revision(repository: RepositoryId, revision: Arc<dyn Revision>) -> Arc<Self> {
+        let connection = Self::detached(Vec::new());
+        connection.revision.insert(repository, revision);
+        connection.revision_ready.complete(Ok(()));
+        connection
+    }
+
     pub fn remote_url(&self) -> &str {
         self.remote_url.as_str()
     }
@@ -1048,17 +1096,8 @@ impl Connection {
         &self.auth_endpoint
     }
 
-    /// The user directory advertised by the server, or its gRPC auth
-    /// service when it advertises none. Independent of the authentication
-    /// path: an OIDC issuer serves no directory.
-    pub fn user_url(&self) -> &str {
-        let grpc_auth_url = self
-            .environment
-            .endpoint
-            .as_ref()
-            .and_then(|endpoint| endpoint.auth_url.as_deref())
-            .unwrap_or_default();
-        self.environment.user_url(grpc_auth_url)
+    pub fn user_directory(&self) -> UserDirectory {
+        UserDirectory::of(&self.environment)
     }
 
     pub fn identity(&self) -> &str {

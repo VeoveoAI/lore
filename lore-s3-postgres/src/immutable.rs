@@ -360,6 +360,13 @@ impl S3PostgresStore {
 
 #[async_trait]
 impl ImmutableStore for S3PostgresStore {
+    /// Nothing on disk to claim: payloads are in S3 and associations in PostgreSQL.
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
+        Ok(None)
+    }
+
     fn isolates_partitions(&self) -> bool {
         true
     }

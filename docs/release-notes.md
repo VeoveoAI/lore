@@ -7,59 +7,44 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
-- A client and the Lore service it relays commands to must come from the same build. Commands, their events and their
-  status cross as bitcode under message protocol version 2, where they crossed as JSON, and bitcode carries no field
-  names to tell two builds apart. A client and a service on either side of this change refuse each other's messages, so
-  restart the service after upgrading
-- Reads trust the local store and check what they fetch by the trust of its source
-  ([ADR-00023](developing/decisions/00023-data-verification-and-trust.md)): no local read hashes its payload, and every
-  payload fetched from a remote is checked against its address on receipt unless the command trusts the remote or a C
-  API reader takes it as stored (`fragments`).
-  `lore-storage`: `ReadOptions` loses `verify` and `trust_local` with `with_verify`, `no_verify` and `trusting_local`,
-  and gains `trust_remote` with `trusting_remote`; `decompress_and_verify` is replaced by `expand_payload`. `read_raw`
-  loses its `verified_by_caller` argument, `fetch_remote` takes `ReadOptions` for its `priority`, `trust_remote` and
-  `decompress`, and `check_fetched` is removed and `fetch_payload` made private. `Loaded::content` is optional,
-  `Flown::take` returns a `Result`, `Flown::Unverified` and `Flown::Rejected` are removed, and a `fetch_single_flight`
-  fetch answers `Loaded`. `file_matches` takes the reader's `trust_remote`. `lore-revision`: `cache_counted` loses its
-  `verify` argument and `RepositoryContext` its `trust_local` setting
-- C API: `skip_verify` on `lore_storage_open_args_t` is now an alias of `trust_remote` for its handle, so a handle that
-  sets it takes payloads fetched from its remote unhashed. Local reads no longer hash either way
-- `lore-storage`: `ReadOptions` loses the unused `with_local`, `no_cache`, `with_direct_write` and
-  `no_max_content_size`, and `with_remote`, which restated the default; `load_raw_local` is removed. `read_into` reports
-  a slice shorter than its content as `Oversized`, as `read_into_buffer` does
-- `lore-storage`: `StoreGetData` gains `content`, the content a store expanded where it checked a payload on receipt, so
-  a struct literal names it. `read::Fetched` is `read::Loaded`, which `read_raw` also returns, and `read_raw` forwards a
-  store's error with its variant rather than as internal
-- C API: `lore_branch_merge_start_args_t` appends `link_paths` and `link_messages`, taking the struct from 80 to 112
-  bytes. Rebuild against the new `lore.h`; a zero-initialized struct keeps today's behavior
-- The server refuses to start when `[server.auth] resource_id_template`, or `resource_template` or `scope_template` in
-  `[server.auth.oidc]`, has no `{id}`. Such a template names the same resource for every partition, so one grant
-  matched every partition. The error names the setting
-- `lore-storage`: `local::fan_out::commit_if_initial_level` returns the `std::io::Result` of its level marker write
-- `lore-storage`: `local::fan_out::commit_if_initial_level` takes the group's `pending_level`,
-  `local::fan_out::remove_stale_new_files` is `remove_stale_files`, and
-  `local::immutable_store::SerializeFailureGuard::new` takes only the bucket's dirty mark. `lore-io`:
-  `IoDriver::write_file_segments_atomic` takes its paths as `impl Into<PathBuf>`, so that a caller hands over the paths
-  it builds rather than having them copied, and removes its temporary file when the write, sync or rename fails
-- `lore-storage`: a local immutable store's `put` refuses a fragment whose flags or sizes contradict each other or its
-  payload, such as store-managed obliteration flags, two compressors, or a fragment list that is not a whole number of
-  references, and stores a flag bit it does not know. A put without its payload to an obliterated association is refused
-  as `PayloadNotFound`; one with its payload replaces the obliteration
+- `lore-server`: with authorization configured, operations that change a partition check for the `write` permission.
+  Any permission on a partition still allows reading it, but no longer allows writing. Servers without authorization
+  configured allow every caller to read, write and administer repositories
+- `lore-server`: changing branch protection, through branch protect and unprotect or by setting the `protect` key in
+  branch metadata, needs `owner` or `admin` on the repository, or `write` for its creator. Previously anyone with
+  access to the repository could set the branch protection rules
+- `lore-server`: vending a presigned URL needs the `presign` permission on the repository instead of the
+  `is_service_account` token claim. Servers without authorization configured still allow every caller to vend
+- Server hooks: `Hook::pre_handler` is now `async`, so a pre-handler can call other services without blocking a worker
+  thread. Custom hooks must make their `pre_handler` async and rebuild. A pre-handler is cancelled at its timeout
+  (1 second, or the hook's own `pre_handler_timeout`), and a timeout now fails the request with `UNAVAILABLE` instead of
+  `INTERNAL`
+- A client connected to a `lores://` remote refuses to connect, failing with `NotSupported`, if the server advertises a
+  storage, revision, lock, repository, or notification endpoint whose scheme doesn't authenticate the server, such as
+  `lore://`. It used to connect to that endpoint without validating its certificate, and for gRPC without TLS. A
+  server that advertises these endpoints must give them a scheme that authenticates the server, such as `lores://`
 
 ### Features
 
-- `lore-server`: with `[server.auth] repository_catalog = "auth_service"` and no `[environment.endpoint] auth_url`,
-  creating or deleting a repository tells the catalog's `repository_catalog_url` through `RebacApi` `CreateResource`
-  and `DeleteResource`, as `auth_url` is told when it is set. A token-claim deployment's issuer then learns of each
-  repository its people create with `lore repository create`, so it can grant and list it; the creation fails if the
-  issuer refuses it, and the issuer decides a deletion
-
-- `LORE_ACCESS_TOKEN` and `LORE_IDENTITY` supply `--access-token` and `--identity` when those flags are absent, as
-  `LORE_AUTH_MODE` does for `--auth-mode`. A flag outranks its variable and an empty value counts as absent.
-  `LORE_IDENTITY` does not apply beside `--identity-token`, which names its own identity, and an opaque token from the
-  environment still requires an identity. A process whose environment holds a placeholder that a trusted transport
-  resolves, such as a sandbox's provider credential, then runs plain `lore` commands with it
-
+- `lore-server`: forward the lock service's `Query` to a remote Lore server, opt-in via `lock_query` under
+  `[server.grpc_public_services.forwarded_requests.enabled_rpcs]`. The peer serves it only when it has a lock store
+- QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a
+  1 MiB initial congestion window, set with `initial_cwnd_bytes`. Values below 2400 bytes are rejected at startup. A
+  periodically refreshed connection starts at no less than this window
+- `lore-server`: connections accepted by `[server.quic_internal]` start sending responses with a 1 MiB congestion
+  window. Set it per endpoint with `initial_cwnd_bytes`; `[server.quic]` keeps its congestion controller's default
+  unless set. Values below 2400 bytes are rejected at startup
+- `lore-server`: with `[server.auth] repository_catalog = "auth_service"` and neither `[environment.endpoint]
+  user_url` nor `auth_url`, creating or deleting a repository registers it at the catalog's `repository_catalog_url`
+  through `RebacApi` `CreateResource` and `DeleteResource`, as it is registered at `auth_url` when that is set. A
+  token-claim deployment's issuer then learns of each repository its people create with `lore repository create`, so
+  it can grant and list it; the creation fails if the issuer refuses it, and the issuer decides a deletion
+- `LORE_IDENTITY` supplies `--identity` when the flag is absent, as `LORE_AUTH_MODE` does for `--auth-mode`. The flag
+  outranks the variable and an empty value counts as absent. `LORE_IDENTITY` does not apply beside an identity token,
+  from `--identity-token` or `LORE_IDENTITY_TOKEN`, which names its own identity. An access token, from
+  `--access-token` or `LORE_ACCESS_TOKEN`, may go with an explicit identity, which an opaque one requires. A process
+  whose environment holds a placeholder that a trusted transport resolves, such as a sandbox's provider credential,
+  then runs plain `lore` commands with it
 - Add the `s3_postgres` native storage plugin: S3-compatible immutable payloads and
   PostgreSQL partition associations, lifecycle state and mutable references in an
   operator-provided schema. The immutable and mutable stores share a bounded pool;
@@ -67,386 +52,336 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   [the backend contract](../../lore-s3-postgres/README.md) for publication,
   interruption, orphan-retention and explicit qualification limits
 
-- `--trust-remote` (C API: `trust_remote` on `lore_global_args_t`) declares the remote a trusted source, for a machine
-  within the remote's own infrastructure where performance comes first, such as a build server streaming from a server
-  in its own backend. A payload fetched from a trusted remote has only its sizes checked against its length, is never
-  hashed, and is decompressed only where its content is read. The field sits in the struct's tail padding, so its size
-  and its other fields' offsets are unchanged. A caller must zero the whole struct, padding included: any non-zero byte
-  there trusts the remote, so a caller built against the earlier header that sets the fields one by one may skip the
-  check
-- `lore-storage`: `read::check_payload_sizes`, the size check every payload takes, `read::check_receipt`, the check on
-  receipt by the remote's trust, `read::heal_on_receipt`, the heal after a check that fails, `read::Loaded::take` and
-  `defragment::MAX_FRAGMENT_TREE_DEPTH` are public
-- Server: added opt-in HTTP health-only mode for deployments that do not serve repository HTTP routes.
+### Fixes & Improvements
 
-- The user identity is read from the token, by the same rule on the client and the server: the `identity` claim, or
-  its namespaced alias `https://lore.org/claims/identity`, where the issuer mints one, and `sub` otherwise. An issuer
-  whose `sub` is not a good identity maps the value it wants into `identity`, such as Entra's `oid` or a username. A
-  token whose deciding claim is empty or not a string is refused. The `[server.auth] identity_claim` setting and the
-  environment response's advertisement of it are gone, since the setting could not reach a token the client reads
-  without the server, such as one passed with `--identity-token` or used under `--offline`
+- A revision named by number, such as `<branch>@<number>`, resolves from the first page the remote returns for it,
+  rather than walking the branch's history back from its latest revision one page at a time
+- Following a branch's history through the remote no longer takes the revisions a page holds above the one it was
+  asked for as that revision's ancestors. A page the server serves from a cached segment holds them, and finding the
+  revision two branches share could answer with one of them, newer than the one they really share
+- On Windows, a Lore service started while another serves the same socket exits without serving, as it does on Linux
+  and macOS. It used to take the socket over and leave the first service running unreachable, holding its SWFS mounts
+  until killed, so commands that each started a service at the same moment could leave one behind per extra command
+- A branch push reads each mutable store key once, loads the branch alongside the pushed revision, and checks the
+  branch name while it verifies the revision's fragments rather than before, so a push spends fewer store round trips
+  before it moves the branch. A push the server refuses because the branch is protected no longer reinstates the name
+  of a deleted branch first
+- The deprecated `urc.rpc` `BranchPush` RPC treats a missing or deleted branch as `lore.revision.v1` `BranchPush`
+  does: a branch without metadata is `NOT_FOUND` rather than an internal error, and a push to a deleted branch
+  reinstates its name, or fails with `ALREADY_EXISTS` when another branch holds the name, rather than failing with
+  `NOT_FOUND`
 
-- `lore auth login` against a server that advertises an OIDC issuer logs in through the OAuth 2.0 device authorization
-  grant (RFC 8628). The login asks the provider for the server's default scopes and `offline_access`, opens the
-  verification URL in the browser, or prints it with `--no-browser`, shows the code the provider's page may ask the user
-  to confirm, polls the token endpoint at the cadence the provider sets, and stores the access token and the refresh
-  token it issues. An ID token the provider returns names the user for display and is neither stored nor sent. After
-  the login, partition operations send the access token itself. When the server advertises `resource_template` or
-  `scope_template`, they send a token the provider issues for that partition through the RFC 8693 token exchange,
-  which names the partition in that one parameter. A token exchange issuer on another host than the login issuer gets
-  the login token only if the token names that host: in its `root_domains` claim, or, without that claim, in its
-  `aud`. Repository metadata set and get and repository delete send the partition's token as well. The client
-  credentials grant is not implemented yet
-- Stored OIDC access tokens renew automatically when expired, using the original public client's refresh grant.
-  Concurrent Lore processes reload and rotate the access/refresh pair under the existing credential-store lock.
-  A refresh response without a replacement refresh token retains the current one; a new login without a refresh
-  token clears the previous login's grant. Grants saved before the client binding was recorded require one new
-  login when their access token expires. Explicitly supplied credentials are never replaced. Transient failures
-  retain the grant, while an `invalid_grant` refusal requires login. The lock gives cooperating processes coherent
-  pairs; it cannot make provider consumption and local persistence transactional across a crash or cancellation
-- `lore branch merge` and `lore branch merge start` accept `--link-message <PATH> <MESSAGE>`, as `lore commit` does,
-  giving the linked repository at `PATH` its own message on the revision a merge auto-commits. A path that is not a
-  link fails the merge before it starts
-- `lore-io`: `IoFile::from_std` wraps a `std::fs::File` the caller already holds, so an `IoDriver` runs positional
-  reads, writes and syncs on that handle without reopening it by path. On Windows the file must be opened with
-  `FILE_FLAG_OVERLAPPED`, and the `iocp` backend binds it to the driver's completion port. The call is `unsafe`: on
-  `iocp` the file takes I/O through that driver alone from then on
-- `lore-server`: every gRPC request records a third latency histogram, `rpc.server.handler.duration`, counted from the
-  server reading the request body to its end rather than from the request headers arriving. The two it joins,
-  `rpc.server.duration` and `http.server.request.duration`, keep counting from the headers, so the gap between them
-  holds the time the client took to send its request and any work done before the body is read, such as authorization,
-  and a client slow to send skews only those two. A bidirectional stream, whose response is ready before its request has
-  been read to its end, records the same value in all three
-- `lore-server`: `BranchPush` records how hard its fragment verification drives the immutable store, once per push and
-  including pushes that fail or are cancelled part-way. Histograms under `lore.branch_push` give the per-address
-  fragment lookups the collection spawns (`fragment_lookups` and `peak_fragment_lookups_in_flight`), the addresses it
-  collects (`collected_addresses`), and the existence query batches sent at once (`concurrent_query_batches`). Debug
-  logs report the same counts per push, with whether the push returned or was dropped, and per collection step
-- `lore`: `lore service status` can be used to get the current status of the currently available Lore service, if any.
-- C API: `lore_storage_get_resolved_item_t` gains `fragments`, which delivers the item's content one leaf at a time as
-  `LORE_EVENT_STORAGE_GET_FRAGMENT`, each event carrying the leaf's `lore_fragment_t` and its payload as stored, in
-  place of `LORE_EVENT_STORAGE_GET_DATA`. No leaf is expanded or checked against its hash, so the reader decodes and
-  verifies what it takes. A reader that wants content compressed the way the store holds it takes the stored payloads
-  instead of the store expanding them and the reader compressing them again. The field sits in the struct's padding,
-  so its size and its other fields' offsets are unchanged, and a zero-initialized item reads as before
-- `lore clone --offline` prepares the clone for working offline. A clone needs the remote, so the flag does not keep it
-  from connecting. With it, or with `--cache`, a clone that writes its files caches every file metadata block of the
-  cloned revision, which staging and committing write to, so both work offline after it, and fails if it cannot. A
-  bare clone, or a clone without either flag, reads them from the remote when a command first needs them
-- Add a Bazel remote execution server on Lore's storage API under `contrib/bazel/`: a Remote Execution API v2 endpoint
-  and scheduler whose action cache and content-addressable storage are Lore partitions, executors that move content
-  between their input roots and a shared loreserver by path, and a script that builds, runs and stops them. A
-  standalone workspace, built from within `contrib/bazel`
+## v0.12.0 (Oct 26th 2026) [#1966]
+
+### Breaking changes
+
+### Features
+
+- `lore service run` runs the Lore service in the current process, returning once it stops, whether by
+  `lore service stop` or by `lore::service::quit` from within the same process. `lore::service::quit` asks a service
+  that `lore::service::run` started in this process to shut down cleanly, and does nothing when none runs there. Neither
+  has a C API equivalent: there is no `lore_service_run` or `lore_service_quit`, so they're available from Rust only.
+  `lore service stop` (C API: `lore_service_stop`) is the way to stop a service from another process.
+- An OIDC login whose access token has expired is renewed with its refresh token (OAuth 2.0 refresh grant, RFC 6749
+  §6) on the next operation, without a new `lore auth login`. The provider's rotated refresh token replaces the used
+  one, and a refresh token the provider refuses is dropped, so the next operation asks for a new login. A client
+  credentials login stores no refresh token
+- `lore auth logout` (C API: `lore_auth_logout`) revokes an OIDC login's refresh token at the provider (OAuth 2.0
+  token revocation, RFC 7009) if the provider advertises a revocation endpoint. A failed revocation, such as at an
+  unreachable provider, now fails the logout, after the login is removed from this machine
 
 ### Fixes & Improvements
 
-- On a server with `[server.auth] resource_claim` set, a repository lookup by name or id answers any verified caller
-  with the repository's id, name and metadata hash, so a client can learn the id it exchanges a token for. Without a
-  grant on the partition the lookup answered not found, so `lore repository clone`, `lore link add`, `lore layer add`,
-  `lore repository info` and `lore repository delete` failed. Reading the metadata or the contents still needs the
-  grant
-- `lore commit --link-message` accepts the link path in any spelling that names it, such as `./vendor/lib/`, as
-  `lore branch merge` does. The path is checked in the library, so a C API commit naming a path that is not a link now
-  fails as invalid arguments. A message for a link with nothing staged is ignored rather than refused
-- A storage handle keeps one server-side session per partition, which its calls share while they carry the same
-  correlation id. A call with another correlation id, given or generated, replaces it, and closing the handle stops it.
-  A revision tree handle keeps its sessions the same way, and repository commands keep theirs on the process's
-  connection to the remote. Each storage call used to leave one session open per storage connection on the connection
-  every handle to the remote shares, so a process that made about 10,000 storage calls to one remote had every later
-  call refused until it restarted, the server allowing that many sessions per connection
-- A QUIC storage session lost with its connection is started again on the connection that replaces it, before the
-  command that found it lost is sent again. The server keeps sessions per connection, so after a reconnect every
-  command on a session started before it failed, and a push that had reconnected failed on its query for the fragments
-  the server holds. A command is now sent under a session id only on the connection that issued it, where an id from a
-  lost connection could name another session on its replacement
-- A storage session pool whose start fails on one of its connections, or is cancelled, stops every session it started,
-  those still starting included. They stayed open on the server for the life of their connection, so once
-  one connection reached the server's session limit, every retry moved the others towards it as well
-- A storage handle, and a server's remote store, reconnect to the remote once the connection they hold has failed. Each
-  kept the failed connection, so once the transport had given up reconnecting, every remote call through it failed
-  until the handle was opened again or the server restarted. Calls waiting on a reconnect share it. A reconnect that
-  fails, or whose connection fails within its back-off, is not repeated until the back-off of 1 to 30 seconds has passed,
-  the calls in between failing at once. A refusal of the credentials is not held, so the next call connects again
-- A QUIC storage or replication connection reconnects when a request goes out on one of its streams that has stopped
-  carrying requests while the connection stays up: the server has stopped reading the stream, as it does once it
-  cannot read or frame a request on it, or the client has stopped reading its answers, as it does after one it cannot
-  parse. Such a request failed without reconnecting or waited forever for an answer, and so did every later request
-  the stream took, until something else made the connection reconnect
-- A QUIC storage request dropped while its frame is being written, as by a caller's timeout, has the rest of the frame
-  written in the background before the stream takes another request; one dropped before any of it was written sends
-  nothing. Requests go to other streams meanwhile, and a stream that does not take the rest within 30 seconds is reset,
-  the next request on it reconnecting. The next request on the stream went out in the middle of the dropped one, so the
-  server read its bytes as the dropped request's payload
-- A QUIC storage session start the server refuses as not authorized forgets the authorization it exchanged and
-  presented, and tries once more with the one an exchange then gives. The process served the refused authorization
-  from its cache, and from the token store, until it expired, so once the server stopped accepting it, by revocation or
-  a change of grants, every storage call for the repository failed meanwhile, in a long-lived process such as the Lore
-  service even after logging out and in again
-- Caches and prefetches check every payload they fetch on receipt, as reads do, unless the command trusts the remote,
-  where they stored most payloads unchecked. A cache walk, which trusts the lists the local store holds, fails once it
-  walks deeper than any fragment tree reaches
-- Every payload a read loads locally has its sizes checked against its fragment, as every fetched payload has whether
-  or not the remote is trusted, and one whose sizes disagree is fetched again and overwritten, as one that does not
-  decompress is, where a read that skipped verification read it as the content and panicked
-- A resolved read whose local root does not load overwrites it with the root the remote resolves to, whether or not the
-  read caches, as a read by address does, where it kept the broken copy and fetched the root on every read
-- A write of content the local store holds and the remote does not reuses the stored payload as it is, its sizes
-  checked, where it decoded and hashed it first, as the local store is trusted
-- `lore-storage`: `read_stream`, `read_into_file` and `read_resolved_into_file` refuse content larger than
-  `ReadOptions::max_content_size`, as every other read does, and the root load enforces the cap for each, refusing a
-  remote resolve over the cap before storing it. A buffer read by address that misses locally with no remote in reach
-  probes the local store once rather than twice, a placement the store answers `SlowDown` is read through the retrying
-  local load before the remote, and local content over the cap is refused without being read again. A read into a
-  slice shorter than its content is refused before any leaf is read
-- `lore repository store immutable query` checks the payload the remote serves against its address, unless the command
-  trusts the remote, and logs one that fails. The query reports it as served and does not walk it
-- A server reaching its backend through the storage protocol (a `remote` store) checks every payload it fetches against
-  its address on receipt, and asks the backend to heal one that fails, where it checked only the payload's sizes. A
-  read of it takes the content the check expanded rather than decompressing the payload again. A buffer read probes a
-  failed placement again only where the store answers `SlowDown`, whatever the store, so a payload failing its check is
-  fetched and heal-requested once rather than twice; a placement the store answers `Oversized` or `NotSupported` fails
-  the read, and any other failure is a miss. A payload stored in a codec the server is built without, such as Oodle, is
-  refused rather than relayed unchecked, and reads as `NotSupported` rather than as missing. To the server's own reads,
-  such as its HTTP content and presigned redeem endpoints, a payload still failing its check after the heal reads as
-  missing, as does a backend it cannot reach or that refuses the connection or the request as unsupported
-- A server checks the sizes of every payload a replica serves it or a peer replicates to it, over QUIC or gRPC, against
-  its fragment, as it does for every other payload, and refuses one whose sizes disagree. A replica's `get` or
-  `get_metadata` response too short to hold its header is refused rather than ending the request in a panic
-- `lore commit` with changes staged in a layer commits the layer while the parent tree holds only changes marked dirty,
-  and leaves those changes dirty. It failed with `Nothing staged for commit` before committing any layer
-- A merge of divergent branch history, such as the one a sync commits when the local and the remote latest have both
-  moved, records the remote's history in the files it changed, and so does the merge of a linked repository whose
-  history diverged in a same-branch `lore branch merge`. The merge is built from the local latest, which can give a
-  file another node ID than the remote latest does when both sides added files after they diverged, and the remote's
-  change was recorded on whichever file had its node ID in the merge. `lore file history` listed the change, under the
-  remote file's path, for an unrelated local file, a file both sides added lost the remote's addition, and a file the
-  remote changed before its latest lost that change. A remote latest that numbers a file past the local tree's last
-  node block failed the commit of the merge
-- `lore file history` of a file the local side added before a merge of divergent history lists that addition. It
-  listed nothing, as the file's history before the merge is on the local, second-parent line
-- A merge of divergent branch history, such as the one a sync stages when the local and the remote latest have both
-  moved, keeps the remote latest as its first parent and the local latest as its second when something is changed on
-  top of it before it is committed. Marking a file dirty, staging, moving or copying a file, setting revision or file
-  metadata, changing file dependencies or links, and a `lore repository verify` that repairs the staged state replaced
-  the first parent with the local latest, and `lore commit --force` committed the merge as an ordinary revision on the
-  local latest, so the revision did not descend from the remote latest
-- `lore file dependency add`, `lore file dependency remove`, `lore file metadata clear` on a tree with nothing staged,
-  and `lore branch merge abort --ignore-links` that restores link pins, no longer carry the current revision's metadata,
-  such as its reviewer, onto the next revision
-- `lore status --scan` that finds a change in the parent tree while only a layer holds staged changes stages it on top
-  of the current revision. It kept the current revision's parents and metadata, so a commit failed with
-  `Staged state has stale parent`, or once the change was staged carried the current revision's metadata
-- After a merge of divergent branch history is committed, `lore status` reports the branch as ahead of the remote. It
-  reported the branch as diverged and asked for another sync until the merge was pushed
-- A change committed through a link pinned at a merge revision has that revision as its only parent. It carried the
-  pin's second parent, so the linked repository recorded a merge of a revision the pin had already merged
-- A change staged more than once inside a nested link before it is committed is committed on the revision the nested
-  link is pinned at. Each staging became the parent of the next, so the nested repository's history took in the staged
-  states and push uploaded them as revisions
-- A merge reports the conflict on a file both branches changed where one of them added the file at a node a deleted
-  file had used. The history the node still held for the deleted file could name a merge of that file from the other
-  branch, and the merge then took the other branch's change as already merged and dropped it without a conflict
-- `lore sync --reset` to a revision where a path is a file, from a working tree where that path is a directory, replaces the directory with the file instead of failing with "Is a directory".
-- The check that prevents the CLI from sending the tokens to 3rd party domains now reads the allowed host list from the following token claims: `root_domains`, `https://lore.org/claims/root_domains`, `aud`. These claims tell which Lore servers are trusted as token receivers. The token's `iss` is no longer added as a trusted domain. Token exchange is implicitly allowed against the same auth server where the token originated from, so the `iss` addition is not needed, and unnecessarily widens the token's allowed domains for non-token-exchange use.
-- `lore repository create` syncs the created repository to disk only under `--sync-data`, as every other command does.
-  It previously always forced a sync
-- Opening a repository lists each store's index directory once to find the groups it has written, rather than checking
-  for each of the 256 possible groups in turn, which every command paid twice before doing any work
-- `lore dirty` on a path inside a link, or on the link's mount, marks the change in the linked repository, so
-  `lore status` reports it without a scan and staging the mount, or a directory above it, picks it up. It previously
-  recorded nothing. The markers survive a commit and a branch switch, `lore status --check-dirty` persists what it
-  verifies inside a link, and a commit pins a link holding only dirty markers at the revision it was linked or updated
-  to. `lore file dirty move` and `copy` refuse a path inside a link
-- Fragment caching keeps at most 512 fetches in flight per connection to a remote, so a read a command needs at once is
-  queued behind at most 512 of them; `LORE_CACHE_GETS` sets another cap, and 0 turns it off. A fetch of content a read
-  or another fetch is already fetching, under any context, shares its get. Each fragment it fetches is retried as a
-  read's fetch is and stored as fetched and as durable, so the client store may evict it. It is not decoded or checked
-  against its address, as a read checks what it loads, unless a read joins its fetch or it is a fragment list, which
-  walking expands; one that fails that check is healed once as a read's fetch is, and one that still fails is not stored
-  and fails the caching as a failed fetch does. A fragment list the local store holds without its subfragments has them
-  fetched, a local list that fails its check is fetched again and overwritten, as a read replaces a corrupt fragment,
-  and an entry the store keeps without its payload is fetched as a miss
-- `lore-storage`: concurrent reads of content missing from the local store fetch it from the remote once, including
-  identical content in different files, and a read that misses while the same content is being stored waits for that
-  store and reads it locally. Every fragment a read fetches from a remote is checked against its sizes and its address
-  on receipt, whether or not the read asked for verification, and one that fails is neither returned nor stored
-- Immutable stores: compaction rewrites a group only once 10% of its packfile bytes are no longer referenced, copying
-  each payload once. Client stores count local-only data toward `max_size` and `max_capacity` but never evict it
-- `lore repository gc` loads the whole store index before evicting, and applies `max_size` to compaction and
-  `max_capacity` to eviction, where it had them swapped
-- Local stores: a process stopped while writing an index bucket no longer leaves the bucket empty, which discarded
-  every entry in it, such as local-only content or branch state
-- Local stores: a failed packfile load, fan-out commit or bucket read no longer discards stored entries or payloads
-- Local stores: an index entry that a machine failure left pointing past the end of its packfile is detected when its
-  bucket loads, and its payload is stored again when next fetched, rather than read back as other content or
-  overwritten by later writes. A packfile whose sync fails takes no more writes
-- Local stores: a flush no longer returns before a bucket write that the delayed flush, another flush, eviction or
-  compaction had started has landed. A process stopped just after a flush could lose entries the flush reported written
-- Local immutable stores: an obliterate writes its tombstone to disk before zeroing the payload, and waits for reads
-  that found the payload and for compaction. A process stopped in between reopened with the entry serving zeros, and a
-  read could return the payload partly zeroed. An obliterate whose tombstone cannot be written fails and leaves the
-  entry as it was, and one that zeroes a payload writes and syncs the index bucket of its entry. Storing the same
-  content under another association, or re-encoding it in the Oodle migration, no longer brings an obliterated entry
-  back with a size of 0, and obliterating a fragment list the store holds without its payload fails instead of leaving
-  its fragments readable
-- Local immutable stores: `PayloadStoredLocal` says whether the store holds an entry's payload, whatever flags it was
-  put with, so a fragment the local store serves carries it, in `get` and in the C API's
-  `LORE_EVENT_STORAGE_GET_FRAGMENT`
-- Writing a file cut into one fragment more than a multiple of 6,553, with a last fragment under 40 bytes, no longer
-  fails, and pushing a file cut into that many fragments no longer fails whatever the size of its last fragment. The
-  file's fragment list ended in a sublist of one reference, which the server refuses, and which the local store refuses
-  where the reference is larger than the fragment it names. The last sublist now holds two references
-- Local stores: a fan-out commit that fails or is stopped part way no longer leaves index entries in the wrong buckets,
-  or files that a later commit's recovery takes in, which served other keys' bytes or brought back an obliterated entry.
-  A commit that failed after its commit point is completed by the group's next flush. A failed level marker write no
-  longer leaves its temporary file behind
-- Local stores: a group of the store index no longer reopens at the wrong bucket layout, where most of its entries could
-  not be found, when its directory cannot be listed at open, as when the process is out of file descriptors, when a new
-  store is stopped before its first index flush, or when writing a group's level marker fails
-- Immutable stores: compaction writes and syncs only the index buckets it changes, rather than every bucket of the group
-  for each packfile it rewrites. In a group of 256 buckets, as on a server, that was 256 synced writes per packfile, and
-  could stall the store for minutes
-- Local stores: a packfile that cannot be listed or read as the store loads its packfiles, as after a transient I/O
-  error, fails the load, which the next access retries. It was left out, and when it was the highest, it was taken for
-  a packfile never written: the index entries pointing into it were cleared, and payloads held only locally were lost
-- Local stores: a store that failed to open its next packfile when one filled, as with no file descriptor left, opens
-  one on its next write. Every write failed with `No more packfiles` until the store was reopened
-- Local stores: a flush dropped part way, as when its caller gives up on it, runs each group flush it started to its end
-  under the group's flush lock, a fan-out commit included, and an obliterate dropped part way runs the write of its
-  tombstone's bucket to its end. A write either had started could otherwise land after the lock was released: a
-  dropped commit could leave its buckets out of the next commit, or its `level.pending` could land after the next flush
-  found none, and the next open then rolled the commit forward over newer bucket files. Either lost entries after a
-  reopen
-- Local stores: the delayed flush completes a fan-out commit that failed after its commit point before it writes a
-  bucket of the group, where the group's buckets waited for an explicit flush. A fan-out commit removes the temporary
-  files that writes stopped before their rename left in its group, and a failed write of an immutable store's info file
-  leaves no temporary file behind
-- Local stores: a store directory that cannot be read as the store opens or loads its packfiles, as after a transient
-  I/O error, fails the open or the load, which a later one retries, with the error the read met. A group directory
-  taken for one never written was laid out at the initial bucket level, where most of its entries could not be found,
-  and a later write then committed that level over its bucket files
-- `lore-storage`: a read of fragmented content into a buffer of its own reads each whole leaf the local store holds
-  straight into its place in that buffer, and expands a compressed leaf there, as a read into a caller's buffer already
-  did. Each leaf was read into a buffer of its own and copied
-- C API: an item reading into `data_out` that stops part way no longer writes the caller's buffer after its call
-  completes. A read's I/O runs to its end even when the read is dropped, so a call now waits for every read it lent a
-  buffer to before it completes. `lore_bytes_mut_t` states that `data_out` must stay valid until then; the header's
-  preamble said argument memory could be freed once an asynchronous call returned. The preamble and `lore_shutdown`
-  state that `lore_shutdown` is safe only once every call has completed
-- `lore-storage`: a read of fragmented content fails when its fragment list's offsets are not strictly increasing. It
-  succeeded, with part of the content holding whatever was in memory before, or the bytes of the wrong leaf
-- Local mutable stores: a store into a bucket whose delayed flush failed starts another. Until an explicit flush, the
-  bucket and every later change to it stayed in memory only
-- `lore commit` reports the error that stopped it, such as a staged file it failed to read, in place of
-  `Recursion task failed`
-- `lore clone` reports the error that stopped it, such as a file it failed to fetch or write, in place of
-  `Recursion task failed`. A clone that fails no longer prints `Clone complete`, and the C API sends
-  `LORE_EVENT_REPOSITORY_CLONE_END` only for a clone that succeeded, as documented. A consumer reads the outcome of a
-  clone from `LORE_EVENT_COMPLETE`, which every clone sends whether it succeeded or failed
-- `loreserver`: a revision list starting at a revision numbered above the branch's latest, such as one a client hasn't
-  pushed, returns no forward cursor in place of stopping the server
-- `lore push` after a push that stopped part way uploads the fragments of a file whose fragment list the server holds
-  and the local store has evicted. Before, the push offered the list alone and failed with a missing fragment on every
-  retry
-- gRPC: concurrent copies of one content to different files each reach the server. Before, a copy answered with the
-  result of another, so a push recorded content the server did not hold, and the branch push failed with a missing
-  fragment on every retry
-- QUIC: the client requests a 512 KiB UDP receive buffer, which Linux allocates as 1 MiB. Linux caps the request at
-  `net.core.rmem_max`; set it to `524288` or more for the full buffer
-- QUIC: BBR's congestion window no longer grows without limit while flow control holds back the sender, and is
-  capped at the connection's send window
-- QUIC: BBR keeps the minimum RTT of the last 10 seconds, floored at 250 µs, in place of the lowest sample ever
-  seen, so one underestimated sample no longer reduces throughput for the rest of a connection
-- `lore`: when the Lore service starts, it logs and skips a registered shared store it cannot open or list, and an
-  instance whose external config it cannot read. One such store or instance left the service without its mount
-  manager, so no SWFS instance was mounted and none could be created
-- A file saved again within the filesystem clock tick it was last written in, at the same size, after a command such
-  as `lore commit` or `lore status --scan` read it, is no longer reported unchanged. The command recorded the file's
-  modified time even where a later write could carry the same one, and the next status trusted the time over the
-  content. Commands now record only times older than the filesystem clock they read before reading any file
-- Remote reads and uploads spread over every storage connection a command opens. They all went through one connection
-  whatever `--max-connections` said
-- On Linux and macOS, two Lore services started at once no longer both run as the service. A service claims its
-  socket name with a lock file beside the socket before it initializes, and one that finds the name claimed waits
-  until the holder answers, then exits, so the commands that started either reach the same service
-- The Lore service's immutable disk stores flush their index 30 seconds after a write, durable writes included.
-  Content the service fetches is stored flagged durable, which scheduled no flush, so a crash lost every entry the
-  service stored since its last explicit flush. Writes that are not durable now flush 30 seconds after the write too,
-  rather than 5
-- A local immutable store schedules its delayed index flush after a write that only changes an existing entry's stored
-  flags, and after a copy, as it does after any other write. Marking a local entry durable and copying content into
-  another partition changed the index without scheduling one, so a crash before the next explicit flush lost those
+- Clone and sync continue materializing available files after an individual write fails, restoring
+  the behavior established by UCS-14675. Failures are reported and the command still exits nonzero.
+
+- `lore file obliterate` warns before deleting content needed by an active branch’s latest revision, including
+  shared child fragments. Incomplete checks report unknown impact; the administrative deletion still proceeds.
+
+- `lore repository verify` fails where it can't read part of the local store, where it passed over it, and checks and
+  heals every fragment a flush in the same process moves to other index buckets meanwhile
+- `lore stage` of several paths under a directory missing from the working directory stages a delete of only those
+  paths, where it staged a delete of the whole directory
+- `lore branch switch <branch> <revision>` takes a revision that names no branch, such as `1234` or `@1234`, on
+  `<branch>`, where it took it on the current branch and refused it as not on the target branch
+- `--dry-run` writes nothing to the working tree. `lore file reset --dry-run` restored, deleted and purged files as a
+  reset without it does, and other commands could write files the same way
+- `--dry-run` changes no branch, revision, staged or layer state and creates no repository. `lore branch create`,
+  `branch reset`, `branch archive`, `revision amend`, `unstage`, `file dependency add`, `layer add` and
+  `repository create` made their changes with `--dry-run` as without it, and `repository create --force --dry-run`
+  removed the existing repository
+- `lore repository clone --dry-run` into an existing directory leaves nothing in it, where it left a `.lore` directory.
+  `repository clone --force --dry-run` over an existing repository fails instead of replacing it, and
+  `repository clone --dry-run --vfs swfs` fails instead of mounting the repository
+- `lore shared-store create --dry-run` creates and registers no shared store, and with `--force` keeps the existing one.
+  `repository clone --dry-run --use-shared-store` fails where it would create the shared store, and a dry run no
+  longer moves a shared store's legacy `global.toml` config to `shared_store.toml`
+- `--dry-run` writes no missing `.lore/instance` file and saves no identity or remote URL to `.lore/config.toml`
+- `lore unstage --dry-run` and `reset --dry-run` of a staged link addition keep the link's files, where they removed
+  them, and `lore file write --dry-run` writes no output outside the repository
+- `--dry-run` changes nothing on the remote. `lore branch create --dry-run` created the branch in linked and layer
+  repositories and with `--force` deleted the existing branch on the remote, `link add` and `layer add` created the
+  current branch in the linked or layer repository, `branch metadata set` and `repository metadata set` stored their
+  values, `branch merge into` pushed the merge to the target branch, and `commit` uploaded the commit's content
+- `lore shared-store set-use-automatically`, `service set-use-automatically` and `service set-executable` change no
+  setting with `--dry-run`, and the service setters say what they would set
+- `lore file obliterate --dry-run` removes no content, where it obliterated the content in the local store and on the
+  remote
+- `lore repository gc --dry-run` collects no garbage, where it evicted and compacted the local store, and
+  `repository verify --heal --dry-run` heals nothing, reporting what it finds as `repository verify` does
+- `lore auth login --dry-run` authenticates and stores no token, and `auth logout --dry-run` and `auth clear --dry-run`
+  remove no token, where all three changed the token store
+- Processes running commands on one repository or shared store at once, such as several `lore history`, no longer wait
+  on each other forever. A command whose process still had the immutable store open from the previous command, and not
+  the mutable store, took the mutable store's lock before the immutable store's, against a process holding the immutable
+  store's lock and waiting for the mutable store's. Every process using the store needs this version: an older one still
+  takes the two locks in that order
+- TLS connections refuse a server certificate issued through one of the eMudhra intermediate CAs whose private keys can
+  be derived from their public keys (RUSTSEC-2026-0382), whichever built-in, operating system or custom root its chain
+  ends in, where they accepted it. The built-in roots no longer include emSign ECC Root CA - G3, emSign Root CA - C1 or
+  emSign ECC Root CA - C3
+- TLS connections abort on a TLS 1.3 handshake message sent at the wrong encryption level, where they accepted it
+  (RUSTSEC-2026-0285). A forged ServerHello no longer makes later connections to the same server offer only a classical
+  key share, which a server could accept without post-quantum key exchange (RUSTSEC-2026-0349). Debug output of a
+  client session leaves out its secrets (RUSTSEC-2026-0346)
+- `lore stage --case keep` of several paths under a directory spelled in another case than the repository's stages them
+  as modified under the repository's case, where on a case-sensitive file system it staged them as deleted
+
+## v0.11.0 (Oct 21st 2026) [#1892]
+
+### Breaking changes
+
+- C API: the new `LORE_EVENT_FILE_AUDIT` event adds a member to `lore_event_t`, so C consumers must rebuild against the
+  new `lore.h`
+- `[environment.endpoint] user_url` now names a `lore.user.v1.UserService` (`UserGet`, `UserFind`), replacing the
+  `UrcAuthApi` `GetUserInfo` and `GetUserId` calls. Without `user_url`, clients ask `auth_url` over `UrcAuthApi` as
+  before. With `user_url`, the server also lists repositories there (`PartitionList`) by default, through the new
+  `[server.auth] repository_catalog = "user_service"` mode, and registers the repositories it creates and deletes there
+  (`PartitionAdd`, `PartitionRemove`) instead of calling `RebacApi` at `auth_url`
+- A client and the Lore service it relays to must come from the same build: the message protocol changed (version 2),
+  and mismatched builds refuse each other's messages. Restart the service after upgrading
+- Data is verified by the trust of its source ([ADR-00023](developing/decisions/00023-data-verification-and-trust.md)):
+  reads from the local store no longer verify hashes, and data fetched from a remote is verified on receipt unless the
+  remote is trusted (`--trust-remote`) or a C API reader takes fragments as stored (`fragments`). C API: `skip_verify`
+  on `lore_storage_open_args_t` is now an alias of `trust_remote` for its handle, so it skips verifying fetched data
+  only
+- C API: `lore_branch_merge_start_args_t` gains `link_paths` and `link_messages`, changing its size; rebuild against the
+  new `lore.h`. A zero-initialized struct keeps today's behavior
+- C API: `lore_auth_login_with_token_args_t` gains `client_id` and `client_secret`, changing its size; rebuild against
+  the new `lore.h`. A zero-initialized struct keeps today's behavior
+- The server refuses to start if `[server.auth] resource_id_template` or `[server.auth.oidc]`
+  `resource_template`/`scope_template` lacks `{id}`, as such a template let one grant match every partition. The error
+  names the setting
+
+### Features
+
+- `lore file audit <path>` is a new command that shows, for each line of a file, the revision that last changed it,
+  grouped into ranges of consecutive lines. The C API offers the same query as `lore_file_audit` and
+  `lore_file_audit_async`
+- `--trust-remote` (C API: `trust_remote` on `lore_global_args_t`) skips hash verification of data fetched from the
+  remote, keeping only a size check, for machines inside the remote's own infrastructure where performance comes first,
+  such as build servers. The field sits in the struct's padding, so callers must zero the whole struct, padding
+  included, or stray bytes turn it on
+- C API: `fragments` on `lore_storage_get_resolved_item_t` delivers content piece by piece as
+  `LORE_EVENT_STORAGE_GET_FRAGMENT`, each with its `lore_fragment_t` and payload as stored, instead of
+  `LORE_EVENT_STORAGE_GET_DATA`. The reader decodes and verifies the payloads itself, and can keep them compressed as
+  stored instead of recompressing. Zero-initialized items read as before
+- `lore auth login` against a server with an OIDC issuer logs in with the OAuth 2.0 device authorization grant (RFC
+  8628), requesting the server's default scopes and `offline_access`: it opens the verification URL in the browser, or
+  prints it with `--no-browser`, shows the code to confirm, and stores the access and refresh tokens.
+  `--token-type <TYPE> --token <TOKEN>` logs in with an existing token through RFC 8693 token exchange, passing the type
+  to the issuer verbatim. Partition operations, repository metadata get/set and repository delete send the access token,
+  or a per-partition token from token exchange when the server advertises `resource_template` or `scope_template`. A
+  token exchange issuer on another host gets the login token only if the token's `root_domains` claim, or else `aud`,
+  names that host. ID tokens are never stored or sent. The refresh grant isn't implemented yet
+- `lore auth login --client-id <ID>` against a server with an OIDC issuer logs in as a confidential client registered
+  at the provider, with the OAuth 2.0 client credentials grant (RFC 6749 §4.4), for CI. The secret comes from
+  `LORE_CLIENT_SECRET`, or from `--client-secret`. The client authenticates with HTTP Basic, or in the form when the
+  provider's discovery document lists only `client_secret_post`. No scope is requested. The C API takes the same login
+  through `client_id` and `client_secret` on `lore_auth_login_with_token_args_t`
+- `--token`, `--identity-token` and `--access-token` fall back to `LORE_TOKEN`, `LORE_IDENTITY_TOKEN` and
+  `LORE_ACCESS_TOKEN` when not given. A secret passed as a flag value, these three or `--client-secret`, now prints a
+  warning, since other users can read it in the process table and the shell history keeps it
+- The user identity is read from the token by the same rule on client and server: the `identity` claim (or
+  `https://lore.org/claims/identity`), else `sub`. An issuer whose `sub` isn't a usable identity maps one into
+  `identity`, such as Entra's `oid`. Tokens with an empty or non-string identity are refused. The
+  `[server.auth] identity_claim` setting, and its advertisement in the environment response, are removed
+- `lore branch merge` and `lore branch merge start` take `--link-message <PATH> <MESSAGE>`, as `lore commit` does, to
+  give a linked repository its own message in an auto-committed merge. A path that isn't a link fails the merge before
+  it starts
+- `lore clone --offline` or `--cache` prepares the clone for working offline: staging and committing then work without a
+  connection, and the clone fails if it can't fetch what they need. The clone itself still needs the remote. Without
+  either flag, the first stage or commit fetches that data from the remote
+- `lore service status` reports the status of the running Lore service, if any
+- `LORE_STORE_RETAIN=1` (or `true`) keeps a process's stores loaded between repository calls and after
+  `lore_storage_close`, without holding their locks, for `store_keep_alive_seconds` (default 10), so calls in that
+  window skip reloading unless another process changed the store. While it's set, don't share a store directory with
+  processes of an earlier build: their changes go unnoticed and stale data is served. Without it, `store_keep_alive`
+  keeps stores loaded and locked for the window
+- Server: `[server.http] health_only = true` serves only `/health_check`, for deployments that don't serve repository
+  HTTP routes
+- `lore-server` metrics: gRPC requests record `rpc.server.handler.duration`, which leaves out the time a client takes to
+  send its request and work done before the body is read, such as authorization, unlike `rpc.server.duration` and
+  `http.server.request.duration` (bidirectional streams record the same value in all three). `BranchPush` records its
+  fragment verification load per push under `lore.branch_push` (`fragment_lookups`, `peak_fragment_lookups_in_flight`,
+  `collected_addresses`, `concurrent_query_batches`), with the same counts in debug logs
+- `contrib/bazel/`: a Bazel remote execution server on Lore storage, as a standalone workspace built from within that
+  directory: a Remote Execution API v2 endpoint and scheduler keeping the action cache and content-addressable storage
+  in Lore partitions, executors that share content through a loreserver, and a script that builds, runs and stops them
+
+### Fixes & Improvements
+
+- Working tree: `lore sync --reset` replaces a directory with a file at the same path instead of failing with "Is a
+  directory". Syncs, branch switches, resets, merges and view changes send `LORE_EVENT_REVISION_SYNC_FILE` for each
+  deleted file and directory, so callers tracking the working tree, such as editors, no longer keep deleted paths. Files
+  and directories named `.urc` or `.lore`, in any case, are ignored by every command that reads the tree, including the
+  virtual filesystem
+- `lore commit` and `lore clone` report the error that stopped them instead of `Recursion task failed`. A failed clone
+  no longer prints `Clone complete`, and the C API sends `LORE_EVENT_REPOSITORY_CLONE_END` only on success;
+  `LORE_EVENT_COMPLETE` reports the outcome either way
+- `lore status`: `--scan` given many paths is faster, scanning them in parallel instead of one after another. Files are
+  listed in path order, stable from run to run. `lore status` and `lore stage <directory>` without `--scan` no longer
+  miss a modified file after a scan that dropped a reverted add. A file saved again at the same size right after a
+  command read it no longer shows as unchanged
+- Merges of divergent history, such as a sync when the local and remote branch both have new revisions, or a diverged
+  link in a same-branch `lore branch merge`: `lore file history` attributes the remote's changes to the right files, a
+  file both sides added keeps the remote's addition, and earlier remote changes are no longer lost. Committing such a
+  merge no longer fails in some cases where the remote side added files, and `lore file history` lists files added
+  locally before it. The merge keeps the remote's latest revision as its first parent when anything is changed on top
+  before committing, including under `lore commit --force`, and once committed `lore status` reports the branch ahead of
+  the remote instead of diverged
+- Layers: `lore commit` with changes staged in a layer commits the layer even when the parent tree holds only unstaged
+  dirty changes, which stay dirty, instead of failing with `Nothing staged for commit`. A `lore status --scan` that
+  finds a parent tree change while only a layer is staged no longer makes the next commit fail with
+  `Staged state has stale parent` or reuse the current revision's metadata. `lore file dependency add`/`remove`,
+  `lore file metadata clear` with nothing staged, and `lore branch merge abort --ignore-links` no longer copy the
+  current revision's metadata, such as its reviewer, onto the next revision
+- Merge conflicts: a merge no longer drops one branch's change to a file without reporting a conflict, in some cases
+  where the other branch added that file after another was deleted. Resolving conflicts to one side
+  (`lore branch merge resolve mine`/`theirs`, and the cherry-pick and revert resolves) no longer uses memory in
+  proportion to the size of the tree
+- Links: committing through a link pinned at a merge revision no longer records a spurious merge in the linked
+  repository, and staging changes inside a nested link more than once no longer pushes the intermediate staged states as
+  revisions. `lore commit --link-message` accepts any spelling of the link path, such as `./vendor/lib/`; a C API commit
+  naming a path that isn't a link fails as invalid arguments, and a message for a link with nothing staged is ignored
+  instead of refused
+- `lore dirty` inside a link, or on its mount, marks the change in the linked repository, where it recorded nothing, so
+  `lore status` reports it without a scan and staging picks it up. The marks survive commits and branch switches,
+  `lore status --check-dirty` saves what it verifies inside links, and a link holding only dirty marks is committed at
+  the revision it's pinned to. `lore file dirty move` and `copy` refuse paths inside a link
+- Lore service: commands it runs use the caller's configuration and credentials (`LORE_GLOBAL_PATH`, `LORE_AUTH_PATH`)
+  instead of the service's. `lore_storage_put`, `lore_storage_put_resolved`, `lore_storage_get` and
+  `lore_storage_get_resolved` now work through the service. A shared store or instance it can't read at startup is
+  logged and skipped, instead of leaving no SWFS instance mounted or creatable. On Linux and macOS, two services started
+  at once no longer both run, so the commands that started them reach the same service
+- Auth: the CLI sends tokens only to hosts named in their `root_domains`, `https://lore.org/claims/root_domains` or
+  `aud` claims, and no longer to the `iss` host except for token exchange. With `[server.auth] resource_claim` set, a
+  repository lookup by name or id answers any verified caller with the repository's id, name and metadata hash, so
+  `lore repository clone`, `lore link add`, `lore layer add`, `lore repository info` and `lore repository delete` no
+  longer fail as not found before the caller holds a grant; reading metadata or contents still needs one. Servers
+  connect to a `ucs-auth://` `auth_url` over TLS, as clients do
+- Server write checks: pushing to a protected branch requires the `push-protected` action, and the `is_service_account`
+  token claim no longer bypasses protection, so grant `push-protected` to mirroring accounts first. The generic
+  `MutableStore` and `MutableCompareAndSwap` requests, including C API `lore_storage` calls with `remote` set and
+  servers with `mutable_store.mode = "remote"`, can no longer write repository metadata, branch metadata or branch
+  latest pointers, which skipped the server's checks; use `RepositoryMetadataSet`, `BranchMetadataSet` and `BranchPush`.
+  The refusal is `InvalidArgument` over gRPC and `Failed` over QUIC. C API calls on a handle's local store are unchanged
+- `RevisionList`: listing from a revision above the branch's latest returns no forward cursor instead of crashing the
+  server, and paging forward through older history on a deep branch no longer times out with `Cancelled`
+- Pushing and committing: some large files, depending on how they split into fragments, no longer fail to commit or
+  push. A `lore push` retried after an interrupted push, and a gRPC push copying the same content to several files, no
+  longer fail on every retry with a missing fragment
+- Verification: caches, prefetches and `lore repository store immutable query` verify fetched data unless the remote is
+  trusted, and data that fails is fetched again once after the server is asked to repair it, then neither returned nor
+  stored (the query logs it and skips it). Corrupt local data is fetched again and replaced instead of crashing an
+  unverified read, and a corrupt local root is replaced once instead of fetched again on every read. A fragment list
+  naming itself or an ancestor fails caching, and local stores refuse to store fragments with inconsistent flags or
+  sizes. Pushing content held in the local store no longer decodes and re-hashes it first
+- Reads: streaming reads and reads into files enforce the content size limit as other reads do, and oversized remote
+  content is refused before it's stored locally. A corrupt fragment list with out-of-order offsets fails the read
+  instead of returning the wrong data. Reads of fragmented content do less redundant work: one local lookup instead of
+  two on a miss with no remote, a busy local store retried before going to the remote, and no extra copy of each piece
+- Fetching: concurrent reads of the same missing content, including identical content in different files, download it
+  once, and a read of content being stored meanwhile waits and reads it locally. Caching runs at most 512 fetches at
+  once per remote connection (`LORE_CACHE_GETS` sets another limit, `0` none), so reads a command needs right away don't
+  queue behind a long cache. Caching shares downloads with reads, fetches what a local fragment list is missing and
+  replaces a corrupt local copy, and what it caches can be evicted from the client store like other fetched data
+- Servers using a `remote` store verify data they fetch from the backend, not only its size, and ask the backend to
+  repair data that fails. Data in a codec the server is built without, such as Oodle, is refused instead of passed on
+  unchecked. The server's HTTP content and presigned redeem endpoints treat data that still fails, or an unreachable
+  backend, as missing. Servers also size-check data from replicas and replicating peers, and no longer crash on a
+  truncated replica response
+- Oodle: the local store's Oodle migration finishes sooner, leaving Oodle data the remote also holds in place. A build
+  without Oodle that finds such data replaces it with the remote's re-encoded copy, and reports `NotSupported` instead
+  of missing data where there's no remote copy
+- Commands start faster, as opening a repository lists each store's index once instead of checking for every possible
+  index group, twice. `lore repository create` syncs to disk only with `--sync-data`, as other commands do
+- Fix a deadlock between processes using one repository, such as the Lore service and a storage handle. Stores are now
+  locked only while in use, so an idle handle or kept-alive store no longer blocks other processes or holds its files
+  open, and background work, such as the flush when a handle closes, no longer leaves other operations on the store
+  running without its lock
+- Local stores no longer lose data after transient I/O errors: a store directory or file that can't be read, as after an
+  I/O error or running out of file descriptors, fails the command for a later retry, where it was treated as never
+  written and index entries and local-only data were discarded. A listing of the local mutable store fails instead of
+  missing entries, and after failing to open a new data file, the next write retries instead of every write failing with
+  `No more packfiles`
+- A listing of the local mutable store no longer misses entries that a flush in the same process moves to other index
+  buckets meanwhile
+- A local store whose `version` file can't be read fails to open, where it was marked for migration again on every open,
+  making every process using it reload it at each use. A store affected by this recovers at its next command connected
+  to the remote; until then, commands without a connection fail with "Unable to upgrade local store to current client,
+  need a connection to server"
+- Local store flushes: entries a flush reported written are no longer lost when a concurrent index write fails, the
+  process stops mid-write, or a mutable store's background flush fails. Entries removed by obliterate, eviction or
+  compaction no longer come back after a reopen, notably on servers, serving another file's data. An entry a machine
+  failure left pointing past the end of its data is detected and fetched again instead of reading as other content, and
+  a data file whose sync fails takes no more writes
+- Background index flushes: local immutable stores schedule one after every change, including marking content durable
+  and copying it to another partition, and the Lore service's disk stores flush 30 seconds after any write, including
+  content it fetched (non-durable writes previously flushed after 5). A crash before the next explicit flush lost these
   changes
-- `lore-server`: the generic `MutableStore` and `MutableCompareAndSwap` storage requests refuse the repository
-  metadata, branch metadata and branch latest pointer key types on every transport, answering `InvalidArgument` over
-  gRPC and the generic `Failed` over QUIC, which has no code for a rejected argument. They previously wrote these keys
-  directly, skipping the checks the dedicated requests make: `RepositoryMetadataSet` and `BranchMetadataSet` check
-  that read-only fields are unchanged and that referenced blobs exist, and `BranchPush` checks branch protection and
-  that the pushed revision's fragments are present. Write these keys through those requests. The C API's
-  `lore_storage` mutable store and compare-and-swap calls made with `remote` set, and a server running with
-  `mutable_store.mode = "remote"`, send these same requests, so neither can write these key types to a server any
-  longer. The C API calls on a handle's local store are unchanged
-- The vendored `quinn-proto` moves to 0.11.19, with `quinn` 0.11.12 and `quinn-udp` 0.5.16. A peer's minimum ACK delay
-  can no longer panic an endpoint that has the ACK frequency extension enabled, and the remote memory-exhaustion,
-  stream-limit bypass and Retry-token issues upstream fixed along the way are closed with it. The MTU black-hole
-  detector no longer reads the ordinary congestion loss of a bulk transfer as a black hole, nor keeps a connection at
-  the minimum MTU once it has fired. A sender held back by flow control now says so with `DATA_BLOCKED` and
-  `STREAM_DATA_BLOCKED`, a path reset also resets pacing, ACKs ride in packets carrying stream data, and path statistics
-  report the minimum RTT. The local `max_rtt` and `TransportErrorCode::is_crypto` additions carry over unchanged
-- `lore-storage`: the local store's Oodle migration leaves durably stored Oodle payloads in place rather than releasing
-  them, so a group holding no local-only Oodle is not rewritten and the pass finishes sooner. A read that cannot decode
-  one replaces it with the remote's copy
-- `lore-storage`: a read in a build without Oodle that finds a durably stored local Oodle payload fetches the remote's
-  re-encoded copy and overwrites the local entry with it, whether or not the read asked to cache. With no remote to
-  fetch from, or for a payload stored only locally, the read reports `NotSupported` rather than a missing address
-- `lore-server`: the `UrcAuthApi` and ReBAC clients dial `[environment.endpoint] auth_url` over TLS when it's configured
-  to use the `ucs-auth://` scheme. The URL was previously handed to tonic unrewritten, which applies TLS only to a
-  literal `https` scheme. This change makes the client->server and server->server grpc calls behave in the same manner.
-- `lore-server`: `RevisionList`'s forward cursor no longer walks a branch's whole history when a step-boundary skip
-  pointer is missing. The boundary nearest the requested page is the one most likely to be absent on history predating
-  the acceleration, and a miss there abandoned the binary search over the sealed boundaries and anchored the descent on
-  the branch's latest revision instead — one state read per revision in between, which on a deep enough branch spends
-  the whole handler timeout and answers `Cancelled`. The search now continues past an unreadable boundary and anchors on
-  the lowest one it still proves sealed. A descent that does run logs progress every 10,000 revisions and its totals on
-  completion, in place of the line per boundary it logged before
-- The vendored `quinn-proto` moves to 0.11.15, bounding how many chunks the stream assembler retains. A peer sending
-  out-of-order stream fragments with many gaps could drive the receiving connection's memory through per-fragment
-  overhead that the byte-based receive windows do not account for, which is remote and needs no credentials (
-  CVE-2026-25800). The local `max_rtt` and `TransportErrorCode::is_crypto` additions carry over unchanged, and the
-  transport-parameter parsing fix Lore had been carrying as a local patch is now upstream
-- QUIC: the client's response reader and the server's stream handler frame messages with parallel chunking. A message
-  whose bytes have all arrived is handed on straight away, rather than waiting behind an earlier message on the same
-  stream that is still missing bytes
-- `.urc` and `.lore`, in any ASCII case, are the repository's own directories and are ignored in every read: a node
-  carrying either name is skipped by clone, sync, status, reset, unstage, diff, the tree and dump listings and the
-  virtual filesystem, as a directory of that name on disk already was
-- `lore status --scan` given many paths scans them in parallel, up to 1,000 at once, where it scanned each path to the
-  end before starting the next, so its time grew with the number of paths given however little each one held. A scan of
-  an untracked path creates the directories above it that the tree does not hold yet, so the ones two or more untracked
-  paths share are created once before the scans start, and only where a scan would create them: a directory holding only
-  ignored or missing paths is still left out of the tree
-- Fix a dirty file being left under a directory not marked as holding one, which a later `lore status` or
-  `lore stage <directory>` without `--scan` reads past. `lore status --scan` dropped an add the user had reverted as
-  soon as it finished the directory holding it, clearing marks up the tree while other directories were still being
-  marked, and marking a file stops at the first directory above it already marked. Reverted adds are now dropped once
-  every directory and every path of the scan has been walked
-- `lore status` lists the files in each section in path order. It listed them in the order the scan found them, which
-  changes from run to run once a scan walks several directories or paths at once
-- A command carried out by the Lore service reads the global configuration and the credentials of the process that ran
-  it, from that process's `LORE_GLOBAL_PATH` and `LORE_AUTH_PATH`. It read the service's own, so a caller that pointed
-  either somewhere else was served from the wrong config and token store
-- `lore_storage_put`, `lore_storage_put_resolved`, `lore_storage_get` and `lore_storage_get_resolved` can be carried out
-  by the Lore service. A buffer a call or a `GET_DATA` event carries could not be read back on the other side of the
-  socket, so relaying one failed
-- Bound how many tasks resolving a conflict to one side runs at once, which `lore branch merge resolve mine` and
-  `theirs` drive, as do the resolves of `lore revision cherry-pick` and `lore revision revert`. It ran a task for every
-  directory it was given and another for every change below each, all live at the same time, so peak memory followed the
-  size of the resolved tree; the directory tasks and the change tasks below them now draw on one budget of 1,000 in
-  flight
-- A sync, branch switch, reset, merge or view change sends a `LORE_EVENT_REVISION_SYNC_FILE` event for each file and
-  directory it deletes. A delete that succeeded sent none, so a caller tracking the working tree through those events,
-  such as an editor updating its asset registry, kept every deleted path. The progress totals counted the deletes all
-  along
+- Local stores: a flush or obliterate cancelled part way, as when a command stops waiting for it, no longer loses
+  entries or lists a key twice after a reopen, and no longer leaves the store locked until its next use. A cancelled
+  write no longer causes needless reloads or a "No such file or directory" error on the next write
+- Local stores: an index reorganization that fails or is interrupted no longer serves other content's data, brings back
+  obliterated content, makes most entries unfindable after a reopen, or leaves temporary files behind. One that failed
+  late is completed by the next flush
+- Obliterate in local stores: the obliteration is saved to disk before the data is zeroed and waits for reads in
+  progress, so a crash or concurrent read no longer sees zeroed or partly zeroed data, and a failed obliterate leaves
+  the content intact. Obliterated content no longer comes back empty when stored again under another context or
+  re-encoded by the Oodle migration, and is restored only by storing it again with its payload. Obliterating content
+  only partly held locally fails instead of leaving some of it readable. `LORE_EVENT_STORAGE_GET_FRAGMENT` flags report
+  correctly whether the local store holds the payload
+- Compaction does far less disk work: it rewrites a data file only once enough of its space has gone unused, copies each
+  payload once, and no longer stalls server stores for minutes by rewriting the whole index for each file. Client stores
+  count local-only data toward `max_size` and `max_capacity` but never evict it. `lore repository gc` loads the full
+  index before evicting and no longer swaps `max_size` (compaction) and `max_capacity` (eviction)
+- Storage sessions: a process making many storage calls to one remote no longer has every later call refused until it
+  restarts, as handles reuse one server session per partition instead of leaving one open per call, and failed or
+  cancelled connection setups no longer leave sessions open. When the server refuses a storage session as unauthorized,
+  as after revoked grants, the client discards its cached authorization and retries once with a fresh one, where every
+  storage call failed until it expired, in the Lore service even after logging in again
+- Reconnects: storage handles and servers' remote stores reconnect after a failed connection instead of failing every
+  call until reopened or restarted. A failed reconnect is retried with a backoff of up to 30 seconds, calls failing at
+  once meanwhile, though a credential refusal doesn't start the backoff. After a QUIC reconnect, commands no longer fail
+  on sessions from the old connection, and a stream that stopped carrying requests reconnects instead of failing or
+  hanging every later request on it. A request cancelled while being sent no longer corrupts the next request on its
+  stream. Reads and uploads use all the connections `--max-connections` allows instead of one
+- QUIC: the vendored `quinn-proto` moves to 0.11.19, fixing CVE-2026-25800 (remote memory exhaustion, no credentials
+  needed) and other upstream memory-exhaustion, stream-limit and Retry-token issues, a crash a peer could trigger with
+  its ACK settings, and path MTU detection that dropped bulk transfers to the minimum packet size
+- QUIC throughput: congestion control no longer over-grows while flow control holds the sender back, or loses throughput
+  for the rest of a connection after one low round-trip sample, and a complete message no longer waits behind an earlier
+  incomplete one on the same stream. The client asks for a larger UDP receive buffer; on Linux, set `net.core.rmem_max`
+  to `524288` or more to allow it
+- C API: a call reading into `data_out` that stops part way no longer writes the caller's buffer after the call
+  completes. `data_out` must stay valid until completion, and `lore_shutdown` is safe only once every call has
+  completed, as `lore.h` now documents, correcting its earlier claim that argument memory could be freed once an
+  asynchronous call returned
+- `lore-server`: server-to-server QUIC traffic uses Cubic congestion control throughout. The internal QUIC server,
+  the replicated immutable store's client and replication clients to peers in every region now use Cubic, where the
+  server and cross-region clients used BBR. Cubic only shrinks the congestion window on packet loss, so a connection
+  that sits quiet between bursts keeps its window rather than having it drained. The public QUIC server keeps BBR
 
 ## v0.10.1 (Oct 5th 2026) [#1475]
 
