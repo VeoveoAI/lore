@@ -1467,3 +1467,252 @@ async fn path_prefix_into_unauthorized_link_returns_not_found() {
     }))
     .await;
 }
+
+/// `RevisionTree` under what `GrpcServerBuilder::partition_scoped` registers: the JWT interceptor
+/// around the partition layer around the service, with the authorizer Bioma selects and a signed
+/// token of the shape Hub issues.
+mod under_the_servers_layers {
+    use std::time::Duration;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    use jsonwebtoken::Algorithm;
+    use jsonwebtoken::DecodingKey;
+    use jsonwebtoken::EncodingKey;
+    use jsonwebtoken::Header;
+    use jsonwebtoken::encode;
+    use lore_proto::lore::thin_client::v1::thin_client_service_client::ThinClientServiceClient;
+    use lore_proto::lore::thin_client::v1::thin_client_service_server::ThinClientServiceServer;
+    use lore_server::auth::jwk::JWKService;
+    use lore_server::auth::jwk::JWKServiceError;
+    use lore_server::auth::jwt::AuthorizationToken;
+    use lore_server::auth::jwt::JwtVerifier;
+    use lore_server::auth::jwt::ResourcePermission;
+    use lore_server::auth::jwt_interceptor::JWTInterceptor;
+    use lore_server::grpc::thinclient::v1::revision_diff::RevisionDiffConfig;
+    use lore_server::grpc::thinclient::v1::service::LoreThinClientV1Service;
+    use lore_server::grpc::tower::partition_access::PartitionAccessLayer;
+    use lore_transport::grpc::PARTITION_ID_KEY;
+    use tonic::Code;
+    use tonic::metadata::BinaryMetadataValue;
+    use tonic::service::interceptor::InterceptedService;
+    use tower::Layer;
+
+    use super::*;
+
+    mockall::mock! {
+        KeySource {}
+
+        #[async_trait::async_trait]
+        impl JWKService for KeySource {
+            async fn get_key(&self, kid: &str) -> Result<(DecodingKey, Algorithm), JWKServiceError>;
+            fn get_cached_key(&self, kid: &str) -> Option<(DecodingKey, Algorithm)>;
+            async fn refresh_key(&self, kid: &str) -> Result<Option<(DecodingKey, Algorithm)>, JWKServiceError>;
+        }
+    }
+
+    fn token_for(repository: Option<RepositoryId>) -> String {
+        let claims = AuthorizationToken {
+            user_id: "a-person".to_string(),
+            issuer: "test".to_string(),
+            audience: vec!["lore".to_string()],
+            expires: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 60,
+            resources: repository.map(|repository| {
+                vec![ResourcePermission {
+                    resource_id: format!("urc-{repository}"),
+                    permission: vec!["read".to_string()],
+                }]
+            }),
+            ..Default::default()
+        };
+        let header = Header {
+            kid: Some("a_kid".to_owned()),
+            alg: Algorithm::HS256,
+            ..Default::default()
+        };
+        encode(&header, &claims, &EncodingKey::from_secret(b"test-secret")).unwrap()
+    }
+
+    fn named(
+        query: Query,
+        token: Option<&str>,
+        keys: &[(&'static str, RepositoryId)],
+    ) -> Request<RevisionTreeRequest> {
+        let mut request = Request::new(RevisionTreeRequest {
+            query: Some(query),
+            path_prefix: None,
+            max_depth: None,
+        });
+        for (key, repository) in keys {
+            request
+                .metadata_mut()
+                .insert_bin(*key, BinaryMetadataValue::from_bytes(repository.data()));
+        }
+        if let Some(token) = token {
+            request
+                .metadata_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        }
+        request
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_token_for_one_repository_is_refused_on_another() {
+        let granted = random::<RepositoryId>();
+        let other = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let context = |repository| {
+                Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ))
+            };
+            let (_, granted_tip) = push_branch_with_files(&context(granted), &["mine.txt"]).await;
+            let (other_branch, other_tip) =
+                push_branch_with_files(&context(other), &["theirs.txt"]).await;
+
+            let authorizer: Arc<dyn RepositoryAuthorizer> =
+                Arc::new(ResourceGrantsAuthorizer::new(
+                    "resources".to_string(),
+                    "resource_id".to_string(),
+                    Some("permission".to_string()),
+                    "urc-{id}".to_string(),
+                    "urc-*".to_string(),
+                ));
+            let mut keys = MockKeySource::new();
+            keys.expect_get_cached_key()
+                .returning(|_| Some((DecodingKey::from_secret(b"test-secret"), Algorithm::HS256)));
+            keys.expect_get_key()
+                .returning(|_| Ok((DecodingKey::from_secret(b"test-secret"), Algorithm::HS256)));
+            keys.expect_refresh_key().returning(|_| Ok(None));
+            let verifier = JwtVerifier {
+                jwk_service: Arc::new(keys),
+                jwt_issuer: None,
+                jwt_audience: Some(vec!["lore".to_string()]),
+                jwt_typ: None,
+            };
+            let service = ThinClientServiceServer::new(LoreThinClientV1Service::new(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                authorizer.clone(),
+                Duration::from_secs(30),
+                RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            ));
+            let stack = InterceptedService::new(
+                PartitionAccessLayer::new(authorizer, Duration::from_secs(5)).layer(service),
+                JWTInterceptor::new(Some(&verifier)),
+            );
+            let mut client = ThinClientServiceClient::new(stack);
+
+            let signature = |tip: Hash| Query::Signature(tip.into());
+            let mine = token_for(Some(granted));
+            let theirs = token_for(Some(other));
+            let nobody = token_for(None);
+
+            // The controls: each token reads its own repository, so both trees are there.
+            for (tip, token, repository, file) in [
+                (granted_tip, &mine, granted, "mine.txt"),
+                (other_tip, &theirs, other, "theirs.txt"),
+            ] {
+                let mut stream = client
+                    .revision_tree(named(
+                        signature(tip),
+                        Some(token),
+                        &[(PARTITION_ID_KEY, repository)],
+                    ))
+                    .await
+                    .expect("a token reads its own repository")
+                    .into_inner();
+                let mut found = false;
+                while let Some(item) = stream.next().await {
+                    if let Some(Payload::Node(node)) = item.expect("stream item").payload {
+                        found |= node.path == file;
+                    }
+                }
+                assert!(found, "{file}");
+            }
+
+            // Refused before the handler, for every way of naming the other repository.
+            let refused = |result: Result<_, Status>, case: &str| {
+                let status = result.map(|_: Response<_>| ()).expect_err(case);
+                assert_eq!(status.code(), Code::PermissionDenied, "{case}");
+                assert_eq!(status.message(), "Unauthorized", "{case}");
+            };
+            refused(
+                client
+                    .revision_tree(named(
+                        signature(other_tip),
+                        Some(&mine),
+                        &[(PARTITION_ID_KEY, other)],
+                    ))
+                    .await,
+                "partition names the other repository",
+            );
+            refused(
+                client
+                    .revision_tree(named(
+                        signature(other_tip),
+                        Some(&mine),
+                        &[(REPOSITORY_ID_KEY, other)],
+                    ))
+                    .await,
+                "the older key names the other repository",
+            );
+            refused(
+                client
+                    .revision_tree(named(
+                        signature(other_tip),
+                        Some(&mine),
+                        &[(PARTITION_ID_KEY, other), (REPOSITORY_ID_KEY, granted)],
+                    ))
+                    .await,
+                "partition other, older key own",
+            );
+            refused(
+                client
+                    .revision_tree(named(
+                        Query::Identifier(model_v1::RevisionIdentifier {
+                            branch_id: other_branch.as_ref().to_vec().into(),
+                            number: 0,
+                        }),
+                        Some(&mine),
+                        &[(PARTITION_ID_KEY, other)],
+                    ))
+                    .await,
+                "the other branch's tip by identifier",
+            );
+            refused(
+                client
+                    .revision_tree(named(
+                        signature(other_tip),
+                        Some(&nobody),
+                        &[(PARTITION_ID_KEY, other)],
+                    ))
+                    .await,
+                "a signed token naming no repository",
+            );
+
+            let status = client
+                .revision_tree(named(
+                    signature(other_tip),
+                    None,
+                    &[(PARTITION_ID_KEY, other)],
+                ))
+                .await
+                .map(|_| ())
+                .expect_err("no token");
+            assert_eq!(status.code(), Code::Unauthenticated);
+        }))
+        .await;
+    }
+}
