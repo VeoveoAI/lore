@@ -26,6 +26,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `lore-server`: `[server.http.certificate]` serves the HTTP endpoint over HTTPS. Without it the endpoint stays plain HTTP
 - `lore-server`: forward the lock service's `Query` to a remote Lore server, opt-in via `lock_query` under
   `[server.grpc_public_services.forwarded_requests.enabled_rpcs]`. The peer serves it only when it has a lock store
 - QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a

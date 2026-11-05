@@ -678,6 +678,7 @@ fn build_lore_http_settings(
     user_agent_filter: Arc<UserAgentFilter>,
 ) -> LoreHttpServerSettings {
     LoreHttpServerSettings {
+        certificate: http_settings.certificate.clone(),
         health_only: http_settings.health_only,
         port: http_settings.port,
         host: http_settings.host.clone(),
@@ -2507,11 +2508,18 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         lore_spawn!(endpoints, {
             let host = http_settings.host.clone();
             let port = http_settings.port;
+            let certificate = http_settings.certificate.clone();
             let user_agent_filter = user_agent_filter.clone();
             let shutdown_rx = _shutdown_rx.clone();
-            LoreHttpServer::serve_maintenance(host, port, user_agent_filter, async move {
-                let _ = shutdown_rx.clone().wait_for(|&v| v).await;
-            })
+            LoreHttpServer::serve_maintenance(
+                host,
+                port,
+                certificate,
+                user_agent_filter,
+                async move {
+                    let _ = shutdown_rx.clone().wait_for(|&v| v).await;
+                },
+            )
         });
     }
 

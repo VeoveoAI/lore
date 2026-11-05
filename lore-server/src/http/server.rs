@@ -17,6 +17,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::middleware;
 use axum::routing;
+use axum::serve::Listener;
 use blake3;
 use hex;
 use lore_base::lore_spawn_net;
@@ -33,12 +34,15 @@ use super::presigned;
 use super::security_headers::ContentTypeAllowlist;
 use super::security_headers::ContentTypePolicy;
 use super::security_headers::PolicyField;
+use super::tls;
+use super::tls::TlsListener;
 use super::tracing::lore_http_tracing;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_axum_middleware::jwt_axum_verify_authorization;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::http::repositories;
+use crate::tls::CertificateSettings;
 use crate::util::core_hop::CoreHopLayer;
 
 #[derive(Clone, Debug)]
@@ -102,6 +106,8 @@ pub struct PresignSettings {
 
 #[derive(Default)]
 pub struct LoreHttpServerSettings {
+    /// When set, the endpoint serves HTTPS with this certificate and key.
+    pub certificate: Option<CertificateSettings>,
     pub health_only: bool,
     pub host: String,
     pub port: i32,
@@ -320,12 +326,15 @@ fn build_router(
     Ok(create_router(shared_state, health, settings))
 }
 
-async fn serve_health_only(
-    listener: TcpListener,
+async fn serve_health_only<L: Listener>(
+    listener: L,
     app: Router,
     store_owner: Arc<dyn lore_storage::ImmutableStore>,
     signal: impl Future<Output = ()> + Send + 'static,
-) -> Result<()> {
+) -> Result<()>
+where
+    L::Addr: std::fmt::Debug,
+{
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = cancellation.clone().drop_guard();
     // Cancellation signals Axum's connection tasks before the serving task releases the store.
@@ -359,6 +368,23 @@ async fn serve_health_only(
     Ok(())
 }
 
+async fn serve_app<L: Listener>(
+    listener: L,
+    app: Router,
+    signal: impl Future<Output = ()> + Send + 'static,
+) -> Result<()>
+where
+    L::Addr: std::fmt::Debug,
+{
+    lore_spawn_net!(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(signal)
+            .await
+    })
+    .await??;
+    Ok(())
+}
+
 impl LoreHttpServer {
     /// Starts a minimal HTTP server that only serves the `/health_check` endpoint.
     ///
@@ -368,6 +394,7 @@ impl LoreHttpServer {
     pub async fn serve_maintenance(
         host: String,
         port: i32,
+        certificate: Option<CertificateSettings>,
         user_agent_filter: Arc<UserAgentFilter>,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
@@ -390,17 +417,14 @@ impl LoreHttpServer {
             .layer(HttpMetricsLayer::new(user_agent_filter))
             .layer(CoreHopLayer);
 
+        let tls_config = certificate.as_ref().map(tls::server_config).transpose()?;
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|err| anyhow!("Failed to start maintenance HTTP server: {err}"))?;
-        lore_spawn_net!(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(signal)
-                .await
-        })
-        .await??;
-
-        Ok(())
+        match tls_config {
+            Some(config) => serve_app(TlsListener::new(listener, config)?, app, signal).await,
+            None => serve_app(listener, app, signal).await,
+        }
     }
 
     pub async fn serve(
@@ -413,10 +437,16 @@ impl LoreHttpServer {
     ) -> Result<()> {
         let addr = SocketAddr::from_str(format!("{}:{}", settings.host, settings.port).as_str())
             .map_err(|err| anyhow!("Failed to start HTTP server: {err}"))?;
+        let tls_config = settings
+            .certificate
+            .as_ref()
+            .map(tls::server_config)
+            .transpose()?;
         info!(
-            "Starting Lore HTTP Server: {}, Auth: {}",
+            "Starting Lore HTTP Server: {}, Auth: {}, TLS: {}",
             &addr,
-            jwt_verifier.as_ref().map_or("no", |_| "yes")
+            jwt_verifier.as_ref().map_or("no", |_| "yes"),
+            tls_config.as_ref().map_or("no", |_| "yes")
         );
 
         // The health-only router holds weak references; its serving task owns the store.
@@ -432,17 +462,18 @@ impl LoreHttpServer {
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|err| anyhow!("Failed to start HTTP server: {err}"))?;
-        if let Some(store_owner) = store_owner {
-            return serve_health_only(listener, app, store_owner, signal).await;
+        match (tls_config, store_owner) {
+            (Some(config), Some(store_owner)) => {
+                let listener = TlsListener::new(listener, config)?;
+                serve_health_only(listener, app, store_owner, signal).await
+            }
+            (Some(config), None) => {
+                serve_app(TlsListener::new(listener, config)?, app, signal).await
+            }
+            (None, Some(store_owner)) => {
+                serve_health_only(listener, app, store_owner, signal).await
+            }
+            (None, None) => serve_app(listener, app, signal).await,
         }
-
-        lore_spawn_net!(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(signal)
-                .await
-        })
-        .await??;
-
-        Ok(())
     }
 }

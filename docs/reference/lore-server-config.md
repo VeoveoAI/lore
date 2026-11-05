@@ -156,7 +156,7 @@ Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.qu
 
 ### HTTP endpoint
 
-`[server.http]` configures the HTTP endpoint that serves the health check and, when enabled, presigned URLs.
+`[server.http]` configures the HTTP endpoint that serves the health check and, when enabled, presigned URLs and repository content.
 
 | Field | Default | Description |
 | --- | --- | --- |
@@ -170,12 +170,17 @@ Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.qu
 | `available_interval_seconds` | `30` | Interval between store-availability probes. |
 | `available_timeout_seconds` | `5` | Timeout for each store-availability probe. |
 | `store_health_check` | `false` | Whether the health check also probes the store. |
+| `certificate` | none | Optional `[server.http.certificate]` block. See below. |
 | `presigned_url_hmac_key` | none | Optional hex-encoded HMAC key that enables the presigned URL feature. See below. |
 | `presigned_url_min_ttl_seconds` | `1` | Minimum lifetime a presigned URL may request. |
 | `presigned_url_default_ttl_seconds` | `3600` | Default presigned URL lifetime. |
 | `presigned_url_max_ttl_seconds` | `86400` | Maximum presigned URL lifetime. |
 | `presigned_url_extra_content_types` | `[]` | Content types added to the default set. See below. |
 | `presigned_url_denied_content_types` | `[]` | Content types removed from that set. See below. |
+
+#### `[server.http.certificate]`
+
+With this block the endpoint serves HTTPS with `cert_file` and `pkey_file`, in PEM, read at startup; a certificate that cannot be loaded stops the server from starting. Without it the endpoint serves plain HTTP. `cert_chain` is not read here, since clients are not asked for certificates: these routes authorize a bearer token. Probes of `/health_check` must then use HTTPS too.
 
 #### `presigned_url_hmac_key`
 

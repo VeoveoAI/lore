@@ -541,7 +541,7 @@ pub(crate) fn default_authorization_timeout_seconds() -> u64 {
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct HttpSettings {
-    #[allow(dead_code)]
+    /// When set, the endpoint serves HTTPS with this certificate and key.
     pub certificate: Option<CertificateSettings>,
     pub enabled: bool,
     /// Serve only the health route, without repository HTTP endpoints.
