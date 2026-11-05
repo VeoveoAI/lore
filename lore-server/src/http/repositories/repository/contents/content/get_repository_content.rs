@@ -10,10 +10,14 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
+use axum::http::header::ACCEPT_RANGES;
 use axum::http::header::CONTENT_DISPOSITION;
 use axum::http::header::CONTENT_ENCODING;
+use axum::http::header::CONTENT_RANGE;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::header::IF_RANGE;
 use axum::http::header::InvalidHeaderValue;
+use axum::http::header::RANGE;
 use axum::response::IntoResponse;
 use hex::FromHexError;
 use lore_base::runtime::LORE_CONTEXT;
@@ -32,6 +36,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::http::byte_range::ByteRange;
 use crate::http::log_http_error;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
@@ -50,10 +55,21 @@ pub enum GetContentError {
     ReadStream(ImmutableError),
     #[error("Failed to generate chunked response headers: {0}")]
     HeaderGeneration(InvalidHeaderValue),
+    #[error("Range not satisfiable in content of {size} bytes")]
+    RangeNotSatisfiable { size: u64 },
 }
 
 impl IntoResponse for GetContentError {
     fn into_response(self) -> axum::response::Response {
+        if let GetContentError::RangeNotSatisfiable { size } = self {
+            log_http_error(&self, StatusCode::RANGE_NOT_SATISFIABLE);
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(CONTENT_RANGE, format!("bytes */{size}"))],
+            )
+                .into_response();
+        }
+
         let (status, msg) = match &self {
             GetContentError::ParseContext(_) | GetContentError::ParseAddress(_) => {
                 (StatusCode::BAD_REQUEST, self.to_string())
@@ -63,7 +79,9 @@ impl IntoResponse for GetContentError {
             {
                 (StatusCode::NOT_FOUND, "address not found".to_string())
             }
-            GetContentError::ReadStream(_) | GetContentError::HeaderGeneration(_) => (
+            GetContentError::ReadStream(_)
+            | GetContentError::HeaderGeneration(_)
+            | GetContentError::RangeNotSatisfiable { .. } => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong. See server log for more info.".to_string(),
             ),
@@ -104,11 +122,21 @@ fn create_stream_response_headers(
         );
     }
 
+    headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     headers.insert(
         CONTENT_LENGTH,
         HeaderValue::from_str(&format!("{content_length}"))?,
     );
     Ok(headers)
+}
+
+/// The range the request asks for. A request with `If-Range` gets the whole content: this
+/// route sends no validator, so whatever it names cannot be shown to match.
+fn requested_range(headers: &HeaderMap) -> Option<ByteRange> {
+    if headers.contains_key(IF_RANGE) {
+        return None;
+    }
+    ByteRange::parse(headers.get(RANGE)?.to_str().ok()?)
 }
 
 pub async fn handler(
@@ -130,6 +158,7 @@ pub async fn handler(
     let parsed_address = address
         .parse::<Address>()
         .map_err(GetContentError::ParseAddress)?;
+    let requested = requested_range(&headers);
 
     let user_id = get_user_id_from_token(user_info);
 
@@ -149,19 +178,56 @@ pub async fn handler(
 
             let options = immutable::read_options_from_repository(&repository);
 
+            // A range needs the content's size before its first byte. Empty content has no
+            // bytes to name, so it is served whole.
+            let range = match requested {
+                Some(requested) => {
+                    let (fragment, _payload) =
+                        immutable::load_raw(repository.clone(), parsed_address, options)
+                            .await
+                            .map_err(GetContentError::ReadStream)?;
+                    let size = fragment.size_content;
+                    if size == 0 {
+                        None
+                    } else {
+                        let range = requested
+                            .resolve(size)
+                            .ok_or(GetContentError::RangeNotSatisfiable { size })?;
+                        Some((range, size))
+                    }
+                }
+                None => None,
+            };
+
             let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
 
+            let read_range = range.as_ref().map(|(range, _size)| {
+                usize::try_from(range.start).unwrap_or(usize::MAX)
+                    ..usize::try_from(range.end).unwrap_or(usize::MAX)
+            });
             let content_length =
-                immutable::read_stream(repository, parsed_address, None, options, tx)
+                immutable::read_stream(repository, parsed_address, read_range, options, tx)
                     .await
                     .map_err(GetContentError::ReadStream)?;
 
             let stream = ReceiverStream::new(rx);
 
-            let headers = create_stream_response_headers(query, content_length)
+            let mut headers = create_stream_response_headers(query, content_length)
                 .map_err(GetContentError::HeaderGeneration)?;
 
-            Ok((StatusCode::OK, headers, Body::from_stream(stream)))
+            let status = match range {
+                Some((range, size)) => {
+                    let value = format!("bytes {}-{}/{size}", range.start, range.end - 1);
+                    headers.insert(
+                        CONTENT_RANGE,
+                        HeaderValue::from_str(&value).map_err(GetContentError::HeaderGeneration)?,
+                    );
+                    StatusCode::PARTIAL_CONTENT
+                }
+                None => StatusCode::OK,
+            };
+
+            Ok((status, headers, Body::from_stream(stream)))
         })
         .await
 }
