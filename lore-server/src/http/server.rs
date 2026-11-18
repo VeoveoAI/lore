@@ -37,7 +37,7 @@ use super::security_headers::PolicyField;
 use super::tls;
 use super::tls::TlsListener;
 use super::tracing::lore_http_tracing;
-use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
 use crate::auth::jwt_axum_middleware::jwt_axum_verify_authorization;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
@@ -69,7 +69,7 @@ pub struct PresignConfig {
 pub struct ServerState {
     pub immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     pub mutable_store: Arc<dyn lore_storage::MutableStore>,
-    pub jwt_verifier: Option<JwtVerifier>,
+    pub token_verification: TokenVerification,
     pub repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     pub max_file_size: u64,
     pub presign_config: Option<PresignConfig>,
@@ -279,7 +279,7 @@ fn build_router(
     settings: &LoreHttpServerSettings,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
-    jwt_verifier: Option<JwtVerifier>,
+    token_verification: TokenVerification,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Router> {
     let health = ServerHealth {
@@ -317,7 +317,7 @@ fn build_router(
     let shared_state = ServerState {
         immutable_store,
         mutable_store,
-        jwt_verifier,
+        token_verification,
         repository_authorizer,
         max_file_size: settings.max_file_size,
         presign_config,
@@ -431,7 +431,7 @@ impl LoreHttpServer {
         settings: LoreHttpServerSettings,
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
-        jwt_verifier: Option<JwtVerifier>,
+        token_verification: TokenVerification,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
@@ -445,7 +445,7 @@ impl LoreHttpServer {
         info!(
             "Starting Lore HTTP Server: {}, Auth: {}, TLS: {}",
             &addr,
-            jwt_verifier.as_ref().map_or("no", |_| "yes"),
+            token_verification.describe(),
             tls_config.as_ref().map_or("no", |_| "yes")
         );
 
@@ -455,7 +455,7 @@ impl LoreHttpServer {
             &settings,
             immutable_store,
             mutable_store,
-            jwt_verifier,
+            token_verification,
             repository_authorizer,
         )?;
 

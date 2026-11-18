@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-pub mod byte_range;
 pub mod health_check;
 pub mod presign_token;
 pub mod presigned;
+pub mod range;
 pub mod repositories;
 pub mod security_headers;
 pub mod server;

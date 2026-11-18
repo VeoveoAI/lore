@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::http::LoreHttpServer;
 use lore_server::http::server::LoreHttpServerSettings;
@@ -57,7 +58,7 @@ async fn with_server<F: Future<Output = ()>>(
                 settings,
                 immutable_store,
                 mutable_store,
-                None,
+                TokenVerification::Ignore,
                 Arc::new(AllowAllRepositoryAuthorizer),
                 async move {
                     let _ = stopped.await;
@@ -154,7 +155,7 @@ async fn a_certificate_that_will_not_load_stops_the_server() {
                 settings,
                 immutable_store,
                 mutable_store,
-                None,
+                TokenVerification::Ignore,
                 Arc::new(AllowAllRepositoryAuthorizer),
                 async {},
             )

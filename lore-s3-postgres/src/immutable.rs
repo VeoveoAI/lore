@@ -17,6 +17,7 @@ use lore_base::types::FragmentReference;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
@@ -654,7 +655,7 @@ impl ImmutableStore for S3PostgresStore {
     fn max_query_batch(&self) -> Option<usize> {
         Some(512)
     }
-    async fn flush(self: Arc<Self>, _sync: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {

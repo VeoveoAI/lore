@@ -30,6 +30,7 @@ mod established_decisions;
 use std::path::PathBuf;
 
 use lore_base::test_util::TempDir;
+use lore_storage::FlushOptions;
 use lore_storage::Partition;
 use lore_storage::local::immutable_store::ImmutableStoreSettings;
 use lore_storage::local::immutable_store::LocalImmutableStore;
@@ -37,15 +38,16 @@ use lore_storage::write::*;
 
 /// A reader looking for a store while its guard drops finds the entry or sees the count
 /// moved, never neither: neither would let it skip the probe that finds the store.
-#[test]
-fn a_dropping_guard_is_never_both_gone_and_uncounted() {
+#[tokio::test]
+async fn a_dropping_guard_is_never_both_gone_and_uncounted() {
+    let (_dir, store) = make_test_store().await;
     let partition = Partition::from([0xC7; 16]);
     let address = Address {
         hash: lore_storage::hash::hash_slice(b"a dropping guard"),
         context: Context::from([0xC7; 16]),
     };
     let before = stores_landed(address);
-    let guard = try_acquire_in_flight(partition, address).expect("fresh address");
+    let guard = try_acquire_in_flight(&store, partition, address).expect("fresh address");
     let seen = std::rc::Rc::new(std::cell::Cell::new(None));
     {
         let seen = seen.clone();
@@ -76,6 +78,28 @@ fn remote_put_retry_accepts_arc_storage_session_and_is_send() {
     {
     }
     ensure_spawn_ok(remote_put_retry);
+}
+
+/// `keep_local` keeps the payload in the writing store without recording anything in the fragment,
+/// so the stores that fetch the fragment later do not cache it on its account, as they do for
+/// `local_cache_priority`.
+#[test]
+fn keeping_a_payload_local_is_not_recorded_in_the_fragment() {
+    let kept = WriteOptions::default().with_keep_local();
+    assert!(kept.cache_local());
+    assert_eq!(
+        kept.as_u32() & FragmentFlags::PayloadLocalCachePriority.bits(),
+        0
+    );
+
+    let prioritized = WriteOptions::default().with_local_cache_priority();
+    assert!(prioritized.cache_local());
+    assert_ne!(
+        prioritized.as_u32() & FragmentFlags::PayloadLocalCachePriority.bits(),
+        0
+    );
+
+    assert!(!WriteOptions::default().cache_local());
 }
 
 async fn make_test_store() -> (TempDir, Arc<dyn ImmutableStore>) {
@@ -295,10 +319,6 @@ fn make_input(seed: u8) -> (Partition, Address, Fragment, Bytes) {
 }
 
 /// [`make_input`] rehomed under `partition`.
-///
-/// [`STORE_IN_FLIGHT`] is keyed on partition and address alone and carries no store identity,
-/// so every test deriving its partition from the same seeds shares in-flight entries with the
-/// rest of the process. A partition of its own keeps a test's leaders and followers to itself.
 fn make_input_in(partition: Partition, seed: u8) -> (Partition, Address, Fragment, Bytes) {
     let (_, address, fragment, buffer) = make_input(seed);
     (partition, address, fragment, buffer)
@@ -386,7 +406,8 @@ async fn store_fragment_follower_path_registers_in_tracker() {
     let (partition, address, fragment, buffer) = make_input(0x30);
 
     // Manually hold a STORE_IN_FLIGHT guard to force the follower path.
-    let held_guard = try_acquire_in_flight(partition, address).expect("acquire in-flight guard");
+    let held_guard =
+        try_acquire_in_flight(&store, partition, address).expect("acquire in-flight guard");
 
     let tracker = Arc::new(WriteTracker::new());
     let result = store_fragment(
@@ -415,6 +436,85 @@ async fn store_fragment_follower_path_registers_in_tracker() {
         msg.contains("leader upload failed"),
         "expected follower's leader-fail error, got: {msg}"
     );
+}
+
+/// A write to a store while a write of the same address to another store is in flight stores the
+/// content in its own store, rather than following the other store's write.
+#[tokio::test]
+async fn a_write_beside_another_stores_write_of_its_address_stores_its_own() {
+    let (_held_dir, held_store) = make_test_store().await;
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, buffer) = make_input(0x31);
+    let _held =
+        try_acquire_in_flight(&held_store, partition, address).expect("acquire in-flight guard");
+    let session = Arc::new(StorageSession::pending(|| async {
+        Err(lore_transport::ProtocolError::internal(
+            "the stand-in remote takes no upload",
+        ))
+    }));
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        store_fragment(
+            store.clone(),
+            partition,
+            address,
+            fragment,
+            buffer,
+            false,
+            Some(session),
+            WriteContext::counted(None),
+            None,
+        ),
+    )
+    .await
+    .expect("the write waited on the other store's write")
+    .expect("store_fragment");
+
+    assert!(!result.deduplicated);
+    assert!(result.stored_local);
+    let resolved = query_one(&store, partition, address)
+        .await
+        .expect("query the store");
+    assert_eq!(resolved.match_made, StoreMatch::MatchFull);
+    assert!(resolved.stored_local);
+}
+
+/// [`a_write_beside_another_stores_write_of_its_address_stores_its_own`], for a write the tracker
+/// dispatches.
+#[tokio::test]
+async fn a_dispatched_write_beside_another_stores_write_of_its_address_stores_its_own() {
+    let (_held_dir, held_store) = make_test_store().await;
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, buffer) = make_input(0x32);
+    let _held =
+        try_acquire_in_flight(&held_store, partition, address).expect("acquire in-flight guard");
+
+    let tracker = Arc::new(WriteTracker::new());
+    let result = store_fragment(
+        store.clone(),
+        partition,
+        address,
+        fragment,
+        buffer,
+        false,
+        None,
+        WriteContext::tracked(Some(tracker.clone()), None),
+        None,
+    )
+    .await
+    .expect("store_fragment");
+    tokio::time::timeout(std::time::Duration::from_secs(10), tracker.await_all())
+        .await
+        .expect("the write waited on the other store's write")
+        .expect("the write stores its own content");
+
+    assert!(!result.deduplicated);
+    let resolved = query_one(&store, partition, address)
+        .await
+        .expect("query the store");
+    assert_eq!(resolved.match_made, StoreMatch::MatchFull);
+    assert!(resolved.stored_local);
 }
 
 #[tokio::test]
@@ -562,8 +662,8 @@ impl ImmutableStore for FailingPutStore {
         None
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
@@ -966,8 +1066,8 @@ impl ImmutableStore for DelayingPutStore {
         None
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
@@ -1251,8 +1351,8 @@ impl ImmutableStore for CountingPutStore {
         None
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
@@ -1318,10 +1418,8 @@ async fn memory_permit_stress_caps_concurrent_leaders_under_budget() {
     });
     let tracker = Arc::new(WriteTracker::new());
 
-    // Dedicated per-test partition so the process-global STORE_IN_FLIGHT
-    // map cannot collide with other tests running in parallel. Each task
-    // within this test gets a unique `context` — combined with the
-    // payload-derived hash, that produces N globally-unique addresses.
+    // Each task gets a unique `context`, which with the payload-derived hash gives N unique
+    // addresses.
     let test_partition = Partition::from([0xA7u8; 16]);
 
     // Spawn N call-site coroutines. Each acquires its own permit from the
@@ -2549,4 +2647,224 @@ async fn lent_content_over_one_fragment_is_stored_fragmented() {
     let content = hash_test_content(lore_storage::compress::FRAGMENT_SIZE_THRESHOLD + 4096);
     let (lent, shared) = lent_and_shared_entries(&content).await;
     assert_eq!(lent, shared);
+}
+
+/// A write with a durable association in the local store as its copy source. The peer answers copy
+/// requests with `SlowDown`, a refusal, or success.
+mod copy_association {
+    use lore_storage::write_stats::FragmentWriteCounts;
+    use lore_storage::write_stats::FragmentWriteStats;
+    use lore_transport::ProtocolError;
+    use lore_transport::test_util::CopyingPeer;
+
+    use super::*;
+
+    /// What the peer was asked for while the write under test ran, and how that write ended.
+    struct Written {
+        result: StoreResult,
+        copies: usize,
+        puts: usize,
+        counts: FragmentWriteCounts,
+        stored: StoreMatchResult,
+    }
+
+    /// Stores content durably under one context of `partition`, then writes the same content under
+    /// another context of `partition`. The second write uses the first association as its copy
+    /// source.
+    async fn write_beside_a_durable_association(
+        partition: Partition,
+        seed: u8,
+        slow_downs: usize,
+        refusal: Option<ProtocolError>,
+    ) -> Written {
+        let (_dir, store) = make_test_store().await;
+        let peer = CopyingPeer::new(slow_downs, refusal);
+        let session = Arc::new(peer.session(partition));
+        let (partition, held, fragment, buffer) = make_input_in(partition, seed);
+        store_fragment(
+            store.clone(),
+            partition,
+            held,
+            fragment,
+            buffer.clone(),
+            false,
+            Some(session.clone()),
+            WriteContext::none(),
+            None,
+        )
+        .await
+        .expect("store the association to copy from");
+        let wanted = Address {
+            hash: held.hash,
+            context: Context::from([seed.wrapping_add(1); 16]),
+        };
+        let copies_before = peer.copies();
+        let puts_before = peer.puts();
+        let stats = Arc::new(FragmentWriteStats::default());
+
+        let result = store_fragment(
+            store.clone(),
+            partition,
+            wanted,
+            fragment,
+            buffer,
+            false,
+            Some(session),
+            WriteContext::counted(Some(stats.clone())),
+            None,
+        )
+        .await
+        .expect("a throttled or refused copy does not fail the write");
+
+        let stored = query_one(&store, partition, wanted)
+            .await
+            .expect("query the written association");
+        Written {
+            result,
+            copies: peer.copies() - copies_before,
+            puts: peer.puts() - puts_before,
+            counts: stats.snapshot(),
+            stored,
+        }
+    }
+
+    /// A copy the peer throttles and then accepts registers the association without its payload.
+    #[tokio::test(start_paused = true)]
+    async fn a_throttled_copy_that_is_accepted_uploads_nothing() {
+        let written =
+            write_beside_a_durable_association(Partition::from([0xC1; 16]), 0xC1, 2, None).await;
+
+        assert_eq!(written.copies, 3);
+        assert_eq!(written.puts, 0);
+        assert_eq!(written.counts.remote_copy_writes, 1);
+        assert!(written.result.stored_durable);
+        assert_eq!(written.stored.match_made, StoreMatch::MatchFull);
+        assert!(written.stored.stored_durable);
+    }
+
+    /// If the peer throttles a copy until retries run out, no payload is uploaded. The payload stays
+    /// local without being marked durable, as when an upload runs out of retries.
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_throttled_through_every_retry_keeps_the_payload_local() {
+        let written =
+            write_beside_a_durable_association(Partition::from([0xC3; 16]), 0xC3, usize::MAX, None)
+                .await;
+
+        assert_eq!(written.copies, lore_storage::store_retry().limit() + 1);
+        assert_eq!(written.puts, 0);
+        assert_eq!(written.counts.remote_copy_writes, 0);
+        assert_eq!(written.counts.remote_upload_failed, 1);
+        assert!(!written.result.stored_durable);
+        assert!(written.result.stored_local);
+        assert_eq!(written.stored.match_made, StoreMatch::MatchFull);
+        assert!(!written.stored.stored_durable);
+    }
+
+    /// A copy refused for a reason other than throttling is not retried, and the payload is uploaded.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_copy_falls_back_to_uploading() {
+        let written = write_beside_a_durable_association(
+            Partition::from([0xC5; 16]),
+            0xC5,
+            0,
+            Some(ProtocolError::from(lore_base::error::NotFound)),
+        )
+        .await;
+
+        assert_eq!(written.copies, 1);
+        assert_eq!(written.puts, 1);
+        assert_eq!(written.counts.remote_copy_writes, 0);
+        assert_eq!(written.counts.remote_put_writes, 1);
+        assert!(written.result.stored_durable);
+        assert!(written.stored.stored_durable);
+    }
+
+    /// A refusal that follows throttling still falls back to uploading the payload.
+    #[tokio::test(start_paused = true)]
+    async fn a_throttled_copy_that_is_then_refused_falls_back_to_uploading() {
+        let written = write_beside_a_durable_association(
+            Partition::from([0xC7; 16]),
+            0xC7,
+            2,
+            Some(ProtocolError::from(lore_base::error::NotFound)),
+        )
+        .await;
+
+        assert_eq!(written.copies, 3);
+        assert_eq!(written.puts, 1);
+        assert_eq!(written.counts.remote_copy_writes, 0);
+        assert_eq!(written.counts.remote_put_writes, 1);
+        assert!(written.result.stored_durable);
+        assert!(written.stored.stored_durable);
+    }
+}
+
+/// A copy the session's peer is asked for directly. The peer answers copy requests with
+/// `SlowDown`, a refusal, or success.
+mod remote_copy_retry {
+    use lore_base::error::NotFound;
+    use lore_storage::CopyOutcome;
+    use lore_storage::remote_copy_retry;
+    use lore_transport::ProtocolError;
+    use lore_transport::test_util::CopyingPeer;
+
+    use super::*;
+
+    fn own() -> Partition {
+        Partition::from([0xE1; 16])
+    }
+
+    fn source() -> Address {
+        Address {
+            hash: Hash::from([0xE2; 32]),
+            context: Context::from([0xE3; 16]),
+        }
+    }
+
+    /// Copies from `partition` into a fresh context on a peer whose responses are set by
+    /// `slow_downs` and `refusal`. Returns the outcome and the copy requests the peer received.
+    async fn copy_from(
+        partition: Partition,
+        slow_downs: usize,
+        refusal: Option<ProtocolError>,
+    ) -> (CopyOutcome, usize) {
+        let peer = CopyingPeer::new(slow_downs, refusal);
+        let session = peer.session(own());
+        let outcome =
+            remote_copy_retry(&session, partition, source(), Context::from([0xE4; 16])).await;
+        (outcome, peer.copies())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_throttled_copy_is_retried_until_accepted() {
+        assert_eq!(copy_from(own(), 2, None).await, (CopyOutcome::Copied, 3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_throttled_through_every_retry_is_reported_throttled() {
+        assert_eq!(
+            copy_from(own(), usize::MAX, None).await,
+            (
+                CopyOutcome::Throttled,
+                lore_storage::store_retry().limit() + 1
+            )
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_is_not_retried() {
+        assert_eq!(
+            copy_from(own(), 0, Some(ProtocolError::from(NotFound))).await,
+            (CopyOutcome::Refused, 1)
+        );
+    }
+
+    /// A source partition the connection holds no claim to is refused without asking the peer.
+    #[tokio::test(start_paused = true)]
+    async fn a_source_partition_without_a_claim_is_refused_unasked() {
+        assert_eq!(
+            copy_from(Partition::from([0xE5; 16]), 0, None).await,
+            (CopyOutcome::Refused, 0)
+        );
+    }
 }

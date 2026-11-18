@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use lore_base::types::Address;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
+use lore_storage::FlushOptions;
 use lore_storage::MutableStore;
 use lore_storage::StoreError;
 use lore_storage::store_types::KeyType;
@@ -150,7 +151,7 @@ impl MutableStore for PostgresMutableStore {
         }
         Ok(stream)
     }
-    async fn flush(self: Arc<Self>, _sync: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 }

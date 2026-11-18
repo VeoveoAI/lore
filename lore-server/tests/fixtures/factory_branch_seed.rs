@@ -14,8 +14,11 @@ use lore_server::authnz::repository_registry::RepositoryRegistry;
 use lore_server::grpc::forwarded_requests::CallerContext;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push::PushAccess;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::repository::v1::repository_create::repository_create_implementation;
 use lore_server::hooks::HookDispatcher;
+use lore_storage::FlushOptions;
 
 struct Instruments;
 impl lore_telemetry::InstrumentProvider for Instruments {
@@ -63,11 +66,12 @@ fn main() -> anyhow::Result<()> {
             lore_server::grpc::handlers::branch_push::push(
                 context.clone(), id, revision, PushAccess { write: true, push_protected: false }, false, false,
                 branch::DEFAULT_HISTORY_STEP_SIZE, Default::default(),
+                &mut PushReport::new(PushHandler::V1, repository.into()),
             ).await?;
         }
         branch::protect(context, main).await?;
-        immutable.flush(true).await?;
-        mutable.flush(true).await?;
+        immutable.flush(FlushOptions::SYNC_DATA).await?;
+        mutable.flush(FlushOptions::SYNC_DATA).await?;
         println!("{}", serde_json::json!({"repository":repository.to_string(),"forbidden":forbidden.to_string(),"main":main.to_string(),"assigned":assigned.to_string(),"other":other.to_string()}));
         Ok::<_,anyhow::Error>(())
     }))

@@ -5,11 +5,18 @@ use std::time::Duration;
 
 use lore_base::error::InvalidPath;
 use lore_base::log::LoreLogLevel;
+use lore_base::lore_spawn;
 use lore_base::lore_spawn_blocking;
 use lore_error_set::ForwardStrict;
 use lore_error_set::error_set;
 use lore_revision::event::EventError;
+use lore_revision::fs::mount_manager_state::MountManagerState;
+use lore_revision::global::DEFAULT_IDLE_CONNECTION_TIMEOUT;
+use lore_revision::global::GlobalConfig;
+use lore_revision::lore_warn;
 use lore_revision::service_state::ServiceStateImpl;
+use lore_revision::util::config::SaveableConfig;
+use lore_transport::connection::close_idle_connections;
 
 use crate::interface::LoreGlobalArgs;
 use crate::remote::connection::ConnectionId;
@@ -22,7 +29,7 @@ use crate::remote::service_process::ServiceStartGuard;
 use crate::remote::service_process::ServiceStopRequest;
 use crate::remote::service_process::begin_service_start;
 use crate::remote::service_process::register_service_process;
-use crate::remote::service_process::service_executable;
+use crate::remote::service_process::service_executable_in;
 use crate::remote::service_process::wait_until_a_service_is_listening;
 use crate::remote::service_socket_name;
 use crate::service::initialization::initialize_service;
@@ -88,25 +95,45 @@ pub async fn service_main(
         return Err(refuse_claimed_socket(&start).await);
     };
 
+    // Taken before the mounts are made, so that every way out of the service from here closes
+    // them, dropping this future at an await among them.
+    let mounts = CloseOnExit::new({
+        let service_state = Arc::clone(&service_state);
+        move || async move { close_swfs_mounts(&service_state).await }
+    });
+
     // Brings up the mount manager and routes its events into the service state.
     initialize_service(globals, Arc::clone(&service_state))
         .await
         .forward::<ServiceMainError>("Failed initializing service")?;
 
-    let listener: UdsListener = claim
-        .listen()
-        .forward::<ServiceMainError>("Failed to start listener socket")?;
+    let listener: UdsListener = match claim.listen() {
+        Ok(listener) => listener,
+        Err(error) => {
+            mounts.close().await;
+            return Err(error).forward::<ServiceMainError>("Failed to start listener socket");
+        }
+    };
     println!("{LISTENING_MESSAGE}");
-    report_build_that_is_not_the_configured_one().await;
+    let idle_connection_timeout = {
+        let config = service_config().await;
+        report_build_that_is_not_the_configured_one(config.as_ref());
+        config.as_ref().map_or(
+            DEFAULT_IDLE_CONNECTION_TIMEOUT,
+            GlobalConfig::service_idle_connection_timeout,
+        )
+    };
 
     // Recorded once the socket is bound, so that a process which lost it never
     // claims to be the service for the moments before it exits.
     register_service_process(&start);
     let stop_request = start.stop_request();
 
-    // Declared after `start`, so that it drops first: the accept loop is told to end
-    // before the process stops being one that runs a service, including when this
-    // future is dropped before it finishes.
+    let _idle_connections = close_idle_connections(idle_connection_timeout);
+
+    // Declared after `start` and `mounts`, so that it drops first: the accept loop is
+    // told to end before the process stops being one that runs a service, and before the
+    // mounts close, including when this future is dropped before it finishes.
     let mut accept_shutdown = AcceptShutdown::new();
     let accept_shutting_down = accept_shutdown.flag();
 
@@ -159,7 +186,85 @@ pub async fn service_main(
         );
     }
 
+    // Once no command can arrive to use a mount, and however the stop was asked for.
+    mounts.close().await;
+
     Ok(())
+}
+
+/// The global config the service reads its settings from when it starts. A config that cannot be
+/// read leaves each setting at its default, since the service runs either way.
+async fn service_config() -> Option<GlobalConfig> {
+    match GlobalConfig::load().await {
+        Ok(config) => Some(config),
+        Err(error) => {
+            lore_warn!(
+                "Could not read the [service] settings from the global config, leaving them at \
+                 their defaults: {error}"
+            );
+            None
+        }
+    }
+}
+
+/// Runs `close` when the service ends, however it ends: the service closes its SWFS mounts with it.
+/// The mount manager is a static, which is never dropped, so a mount not closed by the service is
+/// left to the driver when the process ends - and the driver does not tear down a mount whose client
+/// went away without closing it, which keeps it from unloading.
+///
+/// [`close`](Self::close) runs it and waits. Dropped without that, as when the service future is
+/// dropped, the guard runs it on a task of its own, which outlives the future. It runs once either
+/// way: a close cut short by the future being dropped is not started again, so the close has to
+/// finish its work where a dropped future cannot stop it, as `close_swfs_mounts` does on a blocking
+/// thread.
+#[lore_macro::test_pub]
+struct CloseOnExit<Close, Closing>
+where
+    Close: FnOnce() -> Closing,
+    Closing: Future<Output = ()> + Send + 'static,
+{
+    close: Option<Close>,
+}
+
+impl<Close, Closing> CloseOnExit<Close, Closing>
+where
+    Close: FnOnce() -> Closing,
+    Closing: Future<Output = ()> + Send + 'static,
+{
+    #[lore_macro::test_pub]
+    fn new(close: Close) -> Self {
+        Self { close: Some(close) }
+    }
+
+    /// Runs the close and waits for it.
+    #[lore_macro::test_pub]
+    async fn close(mut self) {
+        if let Some(close) = self.close.take() {
+            close().await;
+        }
+    }
+}
+
+impl<Close, Closing> Drop for CloseOnExit<Close, Closing>
+where
+    Close: FnOnce() -> Closing,
+    Closing: Future<Output = ()> + Send + 'static,
+{
+    fn drop(&mut self) {
+        if let Some(close) = self.close.take() {
+            // Detached: nothing is left to wait for it, and the close must run all the same.
+            drop(lore_spawn!(close()));
+        }
+    }
+}
+
+async fn close_swfs_mounts(service_state: &ServiceStateImpl) {
+    let Some(manager) = MountManagerState::mount_manager() else {
+        return;
+    };
+    if let Err(error) = manager.swfs().close_all().await {
+        service_state.push_log(LoreLogLevel::Error, error.to_string());
+    }
 }
 
 /// Ends the accept loop, which owns the listener on a blocking thread that a
@@ -227,13 +332,13 @@ async fn refuse_claimed_socket(start: &ServiceStartGuard) -> ServiceMainError {
 }
 
 /// Reports serving from a build other than the one that would be started
-/// automatically, which is the one the global config names when it names any.
+/// automatically, which is the one `config` names when it names any.
 ///
 /// Running a service from a chosen build is allowed: whoever ran this command
 /// picked it. What is not wanted is silence about it afterwards, when a service
 /// started long ago from a stale path is serving a machine and nothing says so.
-async fn report_build_that_is_not_the_configured_one() {
-    let Ok(configured) = service_executable().await else {
+fn report_build_that_is_not_the_configured_one(config: Option<&GlobalConfig>) {
+    let Ok(configured) = service_executable_in(config) else {
         return;
     };
     let Ok(running) = std::env::current_exe() else {

@@ -130,6 +130,7 @@ async fn processes_reload_the_rotated_grant_under_the_native_lock() {
         &token(&provider.issuer, 1),
         vec![DOMAIN.to_owned()],
         Some("process-refresh-1"),
+        0,
         None,
     )
     .await
