@@ -5,7 +5,9 @@ all-features = true
 feature-depth = 1
 
 [advisories]
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, with no patched release; Lore's own crates use it directly" },
+]
 
 [licenses]
 version = 2
