@@ -1,6 +1,8 @@
 ---
 lep: 2026-11-25-exact-text-repository-list
 title: Exact text metadata in repository listings
+authors:
+  - rozgo
 status: Draft
 created: 2026-11-25
 updated: 2026-11-25
@@ -23,7 +25,19 @@ loads each authorized repository's metadata to build its record. Applying the
 predicate to that same decoded value avoids source checkout and per-repository
 network requests.
 
-## Proposed design
+## Goals / Non-Goals
+
+### Goals
+
+- Discover exact native text matches within the caller's authorized catalog in one RPC.
+- Let clients distinguish supported empty results from ignored optional predicates.
+
+### Non-Goals
+
+- Cross-repository snapshot isolation, full-text search or a metadata index.
+- Project-specific rules or changes to stored metadata and caller grants.
+
+## Proposed Design
 
 `RepositoryListRequest.text_metadata` optionally carries `RepositoryTextMetadata`
 with `key` and `text`. The key is nonempty and at most 256 UTF-8 bytes; text is at
@@ -57,18 +71,65 @@ to each selected response. The predicate is shared across existing candidate tas
 No durable or cross-request state is added. Metadata changes are observed at each
 repository's existing read boundary, not a new catalog-wide transaction.
 
-## Security
+## Migration Plan
+
+N/A — additive optional fields require no stored-data migration. Qualify the native
+server first; a filtered client fails closed until support and match echoes exist.
+Unfiltered clients continue to use the same RPC and results.
+
+## Security Considerations
 
 The predicate never discovers repositories outside the caller's native catalog.
 Other metadata keys and values are not projected. Missing/nontext metadata is not
 coerced to text. Failures are not represented as a negative match.
 
+## Privacy Considerations
+
+The authorized catalog is consulted before metadata inspection. Each result adds
+only the requested matching key and text; unrelated values are not projected.
+
+## Risks and Assumptions
+
+- **Assumption:** the configured catalog returns only repositories readable by the
+  caller — *invalidated if:* its authorization contract is violated.
+- **Risk:** metadata reads fail during enumeration — *mitigation:* a filtered stream
+  returns an error instead of treating unreadable candidates as non-matches.
+- **Risk:** metadata changes while listing — *mitigation:* document the existing
+  per-repository read boundary; there is no cross-repository snapshot claim.
+
+## Drawbacks
+
+- The server still performs O(caller-readable repositories) metadata reads. This
+  avoids per-repository client handshakes but does not provide an indexed query.
+
+## Alternatives Considered
+
+### Client reads every repository
+
+Rejected because separate metadata reads repeat network and decoding work that
+RepositoryList already performs.
+
+### Dedicated discovery index
+
+Rejected because it introduces mutable derived state, freshness and authorization
+responsibilities beyond the existing native catalog.
+
+## Unresolved Questions
+
+- The draft requires public protocol review before merge; implementation may be
+  qualified on a non-default development branch in the meantime.
+
 ## Validation
 
 Native in-memory store tests cover exact text, case/type mismatch, missing keys,
 creator conjunction, unreadable metadata, authorized subsets, plain listing,
-filter bounds and an empty supported stream. Hub tests must reject absent support
-and incorrect echoes before adopting the new filtered API.
+filter bounds and an empty supported stream. Client tests must reject absent support
+and incorrect echoes before adopting the new filtered API. The relevant native
+[handler](../../lore-server/src/grpc/repository/v1/repository_list.rs),
+[metadata decoder](../../lore-revision/src/metadata.rs),
+[built-in fields](../../lore-revision/src/repository.rs) and
+[unit tests](../../lore-server/tests/unit/grpc/repository/v1/repository_list.rs)
+define and exercise these contracts.
 
 ## Adoption
 
