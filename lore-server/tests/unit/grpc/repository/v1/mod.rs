@@ -4,6 +4,7 @@
 mod repository_create;
 mod repository_delete;
 mod repository_get;
+mod repository_list;
 mod repository_metadata_get;
 mod repository_metadata_set;
 mod service;

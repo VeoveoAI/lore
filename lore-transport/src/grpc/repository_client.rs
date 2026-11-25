@@ -161,7 +161,10 @@ impl<I: Interceptor + Clone + Send + Sync + 'static> RepositoryService<I> {
     pub async fn list(&self) -> Result<Vec<RepositoryData>, ProtocolError> {
         let mut retry = grpc_retry();
         let repositories = loop {
-            let request = repository_v1::RepositoryListRequest { creator: None };
+            let request = repository_v1::RepositoryListRequest {
+                creator: None,
+                text_metadata: None,
+            };
 
             let mut client = self.client.clone();
 

@@ -8,8 +8,10 @@ use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_proto::lore::repository::v1::RepositoryListRequest;
 use lore_proto::lore::repository::v1::RepositoryListResponse;
+use lore_proto::lore::repository::v1::RepositoryTextMetadata;
 use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
+use lore_revision::metadata::{Metadata, MetadataType};
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use tokio::sync::mpsc;
@@ -57,6 +59,19 @@ pub async fn handler(
     let token = get_verified_token(request.extensions()).map(|token| token.owned());
     let req = request.into_inner();
     let creator_filter = req.creator;
+    let filtered = req.text_metadata.is_some();
+    let text_filter = req
+        .text_metadata
+        .map(|filter| {
+            if filter.key.is_empty() || filter.key.len() > 256 || filter.text.len() > 4096 {
+                Err(Status::invalid_argument(
+                    "repository text predicate exceeds its bounds",
+                ))
+            } else {
+                Ok(Arc::new(filter))
+            }
+        })
+        .transpose()?;
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
@@ -81,6 +96,7 @@ pub async fn handler(
                     let immutable_store = immutable_store.clone();
                     let mutable_store = mutable_store.clone();
                     let creator_filter = creator_filter.clone();
+                    let text_filter = text_filter.clone();
                     let tx = tx.clone();
                     lore_spawn!(
                         tasks,
@@ -91,6 +107,7 @@ pub async fn handler(
                                     mutable_store,
                                     id,
                                     creator_filter,
+                                    text_filter,
                                 )
                                 .await;
                                 if let Some(item) = item
@@ -108,7 +125,15 @@ pub async fn handler(
     );
 
     let recv_stream = ReceiverStream::from(rx);
-    Ok(Response::new(Box::pin(recv_stream) as ListStream))
+    let mut response = Response::new(Box::pin(recv_stream) as ListStream);
+    if filtered {
+        response.metadata_mut().insert(
+            "lore-repository-text-filter",
+            "1".parse()
+                .map_err(|_| Status::internal("invalid static repository filter header"))?,
+        );
+    }
+    Ok(response)
 }
 
 /// Build one repository record. A repository whose metadata cannot be read is
@@ -121,6 +146,7 @@ async fn load_and_filter_repository(
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     id: RepositoryId,
     creator_filter: Option<String>,
+    text_filter: Option<Arc<RepositoryTextMetadata>>,
 ) -> Option<Result<RepositoryListResponse, Status>> {
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
@@ -136,10 +162,12 @@ async fn load_and_filter_repository(
         Ok(Ok(hash)) => hash,
         Ok(Err(err)) => {
             debug!(%id, %err, "Repository list: metadata hash unavailable, skipping");
-            return None;
+            return text_filter
+                .as_ref()
+                .map(|_| Err(Status::unavailable("repository metadata unavailable")));
         }
     };
-    let metadata = match repository::metadata(repository.clone(), metadata_hash)
+    let raw = match Metadata::deserialize(repository.clone(), metadata_hash)
         .await
         .filter_slow_down()
     {
@@ -147,7 +175,28 @@ async fn load_and_filter_repository(
         Ok(Ok(metadata)) => metadata,
         Ok(Err(err)) => {
             debug!(%id, %err, "Repository list: metadata blob unavailable, skipping");
-            return None;
+            return text_filter
+                .as_ref()
+                .map(|_| Err(Status::unavailable("repository metadata unavailable")));
+        }
+    };
+
+    let matched_text_metadata = if let Some(filter) = text_filter.as_ref() {
+        match matches_text(&raw, filter) {
+            Ok(true) => Some((**filter).clone()),
+            Ok(false) => return None,
+            Err(status) => return Some(Err(status)),
+        }
+    } else {
+        None
+    };
+    let metadata = match repository::metadata_fields(&raw) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            debug!(%id, %error, "Repository list: built-in metadata unavailable");
+            return text_filter
+                .as_ref()
+                .map(|_| Err(Status::unavailable("repository metadata unavailable")));
         }
     };
 
@@ -159,5 +208,17 @@ async fn load_and_filter_repository(
 
     Some(Ok(RepositoryListResponse {
         repository: Some(build_repository(id, &metadata, metadata_hash)),
+        matched_text_metadata,
     }))
+}
+
+fn matches_text(metadata: &Metadata, filter: &RepositoryTextMetadata) -> Result<bool, Status> {
+    match metadata.get_typed(&filter.key) {
+        Ok((value, MetadataType::String)) => Metadata::to_string(value)
+            .map(|text| text == filter.text)
+            .map_err(|_| Status::unavailable("repository text metadata unavailable")),
+        Ok(_) => Ok(false),
+        Err(error) if error.is_file_not_found() => Ok(false),
+        Err(_) => Err(Status::unavailable("repository text metadata unavailable")),
+    }
 }

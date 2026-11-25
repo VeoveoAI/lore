@@ -4850,6 +4850,11 @@ pub async fn metadata(
         .await
         .forward::<RepositoryError>("Repository not found")?;
 
+    metadata_fields(&metadata)
+}
+
+/// Read the repository's built-in fields from already decoded native metadata.
+pub fn metadata_fields(metadata: &Metadata) -> Result<RepositoryMetadata, RepositoryError> {
     Ok(RepositoryMetadata {
         name: metadata
             .get_string(NAME)

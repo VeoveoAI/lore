@@ -57,8 +57,14 @@ fn v1_repository_field_shapes() {
     let _ = RepositoryGetQuery::Name(Default::default());
     let RepositoryGetResponse { repository: _ } = RepositoryGetResponse::default();
 
-    let RepositoryListRequest { creator: _ } = RepositoryListRequest::default();
-    let RepositoryListResponse { repository: _ } = RepositoryListResponse::default();
+    let RepositoryListRequest {
+        creator: _,
+        text_metadata: _,
+    } = RepositoryListRequest::default();
+    let RepositoryListResponse {
+        repository: _,
+        matched_text_metadata: _,
+    } = RepositoryListResponse::default();
 
     let RepositoryMetadataGetRequest { id: _ } = RepositoryMetadataGetRequest::default();
     let RepositoryMetadataGetResponse { metadata: _ } = RepositoryMetadataGetResponse::default();

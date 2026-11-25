@@ -102,6 +102,12 @@ message RepositoryGetResponse {
   lore.model.v1.Repository repository = 1;
 }
 
+// One exact native String metadata value, without coercion or pattern matching.
+message RepositoryTextMetadata {
+  string key = 1;
+  string text = 2;
+}
+
 // Request to stream repositories the caller is authorised to see, with
 // optional filters. When auth is configured the server first consults
 // the auth service for the caller's permitted resource set; when auth is
@@ -110,6 +116,9 @@ message RepositoryListRequest {
   // If set, only repositories whose `creator` field is an exact
   // byte-for-byte case-sensitive match are emitted.
   optional string creator = 1;
+  // Optional exact text predicate. Filtered responses announce support through
+  // initial gRPC metadata lore-repository-text-filter: 1, including empty streams.
+  RepositoryTextMetadata text_metadata = 2;
 }
 
 // One-per-stream-message response carrying a single repository record.
@@ -117,6 +126,8 @@ message RepositoryListResponse {
   // A repository matching the request's filters and the caller's
   // authorisation.
   lore.model.v1.Repository repository = 1;
+  // Explicit match for text_metadata; absent for ordinary unfiltered listings.
+  RepositoryTextMetadata matched_text_metadata = 2;
 }
 
 // Request for a cheap hash-only read of a repository's metadata pointer.
