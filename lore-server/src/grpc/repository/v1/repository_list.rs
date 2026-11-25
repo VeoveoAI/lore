@@ -136,11 +136,10 @@ pub async fn handler(
     Ok(response)
 }
 
-/// Build one repository record. A repository whose metadata cannot be read is
-/// skipped with `None`, since a partially-written repository should not fail
-/// the whole listing. A store asking the caller to back off is emitted onto
-/// the stream instead, so the client is told to retry rather than handed a
-/// listing with repositories silently missing from it.
+/// Build one authorized repository record from one decoded metadata blob.
+/// Unfiltered listings skip unreadable metadata. Filtered listings emit an
+/// unavailable status, since a failed read cannot establish a negative match.
+/// A store asking the caller to back off always emits its status.
 async fn load_and_filter_repository(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
@@ -161,7 +160,7 @@ async fn load_and_filter_repository(
         Err(status) => return Some(Err(status)),
         Ok(Ok(hash)) => hash,
         Ok(Err(err)) => {
-            debug!(%id, %err, "Repository list: metadata hash unavailable, skipping");
+            debug!(%id, %err, "Repository list: metadata hash unavailable");
             return text_filter
                 .as_ref()
                 .map(|_| Err(Status::unavailable("repository metadata unavailable")));
@@ -174,7 +173,7 @@ async fn load_and_filter_repository(
         Err(status) => return Some(Err(status)),
         Ok(Ok(metadata)) => metadata,
         Ok(Err(err)) => {
-            debug!(%id, %err, "Repository list: metadata blob unavailable, skipping");
+            debug!(%id, %err, "Repository list: metadata blob unavailable");
             return text_filter
                 .as_ref()
                 .map(|_| Err(Status::unavailable("repository metadata unavailable")));
