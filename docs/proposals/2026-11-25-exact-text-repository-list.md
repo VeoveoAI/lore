@@ -114,6 +114,12 @@ RepositoryList already performs.
 Rejected because it introduces mutable derived state, freshness and authorization
 responsibilities beyond the existing native catalog.
 
+## Prior Art
+
+The existing native [RepositoryList creator predicate](../../lore-proto/proto/lore/repository/v1/repository.proto)
+already filters authorized results by exact text. This proposal applies the same
+query shape to one typed native metadata entry and adds explicit support evidence.
+
 ## Unresolved Questions
 
 - The draft requires public protocol review before merge; implementation may be
