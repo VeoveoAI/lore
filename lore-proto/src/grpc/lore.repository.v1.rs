@@ -295,10 +295,10 @@ pub mod repository_service_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value
+        clippy::let_unit_value,
     )]
-    use tonic::codegen::http::Uri;
     use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
     /// Baseline repository-management service. Carries the lifecycle and
     /// metadata-pointer primitives — repository create / delete, lookup, list,
     /// and CAS update of the repository metadata pointer. The repository
@@ -342,13 +342,14 @@ pub mod repository_service_client {
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
             T: tonic::codegen::Service<
-                    http::Request<tonic::body::Body>,
-                    Response = http::Response<
-                        <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
-                    >,
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
                 >,
-            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
-                Into<StdError> + std::marker::Send + std::marker::Sync,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             RepositoryServiceClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -391,20 +392,30 @@ pub mod repository_service_client {
         pub async fn repository_create(
             &mut self,
             request: impl tonic::IntoRequest<super::RepositoryCreateRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryCreateResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryCreateResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/lore.repository.v1.RepositoryService/RepositoryCreate",
             );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "lore.repository.v1.RepositoryService",
-                "RepositoryCreate",
-            ));
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.RepositoryService",
+                        "RepositoryCreate",
+                    ),
+                );
             self.inner.unary(req, path, codec).await
         }
         /// Hard-delete a repository: clears the name → id mapping, zeroes the
@@ -412,40 +423,60 @@ pub mod repository_service_client {
         pub async fn repository_delete(
             &mut self,
             request: impl tonic::IntoRequest<super::RepositoryDeleteRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryDeleteResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryDeleteResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/lore.repository.v1.RepositoryService/RepositoryDelete",
             );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "lore.repository.v1.RepositoryService",
-                "RepositoryDelete",
-            ));
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.RepositoryService",
+                        "RepositoryDelete",
+                    ),
+                );
             self.inner.unary(req, path, codec).await
         }
         /// Look up a repository by id or by name.
         pub async fn repository_get(
             &mut self,
             request: impl tonic::IntoRequest<super::RepositoryGetRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryGetResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryGetResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/lore.repository.v1.RepositoryService/RepositoryGet",
             );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "lore.repository.v1.RepositoryService",
-                "RepositoryGet",
-            ));
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.RepositoryService",
+                        "RepositoryGet",
+                    ),
+                );
             self.inner.unary(req, path, codec).await
         }
         /// Stream all repositories the caller is authorised to see.
@@ -456,38 +487,56 @@ pub mod repository_service_client {
             tonic::Response<tonic::codec::Streaming<super::RepositoryListResponse>>,
             tonic::Status,
         > {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/lore.repository.v1.RepositoryService/RepositoryList",
             );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "lore.repository.v1.RepositoryService",
-                "RepositoryList",
-            ));
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.RepositoryService",
+                        "RepositoryList",
+                    ),
+                );
             self.inner.server_streaming(req, path, codec).await
         }
         /// Cheap hash-only read of a repository's current metadata pointer.
         pub async fn repository_metadata_get(
             &mut self,
             request: impl tonic::IntoRequest<super::RepositoryMetadataGetRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryMetadataGetResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryMetadataGetResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/lore.repository.v1.RepositoryService/RepositoryMetadataGet",
             );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "lore.repository.v1.RepositoryService",
-                "RepositoryMetadataGet",
-            ));
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.RepositoryService",
+                        "RepositoryMetadataGet",
+                    ),
+                );
             self.inner.unary(req, path, codec).await
         }
         /// Compare-and-swap update of a repository's metadata pointer. CAS miss is
@@ -495,20 +544,30 @@ pub mod repository_service_client {
         pub async fn repository_metadata_set(
             &mut self,
             request: impl tonic::IntoRequest<super::RepositoryMetadataSetRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryMetadataSetResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryMetadataSetResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/lore.repository.v1.RepositoryService/RepositoryMetadataSet",
             );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "lore.repository.v1.RepositoryService",
-                "RepositoryMetadataSet",
-            ));
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.RepositoryService",
+                        "RepositoryMetadataSet",
+                    ),
+                );
             self.inner.unary(req, path, codec).await
         }
     }
@@ -520,7 +579,7 @@ pub mod repository_service_server {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value
+        clippy::let_unit_value,
     )]
     use tonic::codegen::*;
     /// Generated trait containing gRPC methods that should be implemented for use with RepositoryServiceServer.
@@ -534,39 +593,58 @@ pub mod repository_service_server {
         async fn repository_create(
             &self,
             request: tonic::Request<super::RepositoryCreateRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryCreateResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryCreateResponse>,
+            tonic::Status,
+        >;
         /// Hard-delete a repository: clears the name → id mapping, zeroes the
         /// metadata pointer, and tears down all branches.
         async fn repository_delete(
             &self,
             request: tonic::Request<super::RepositoryDeleteRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryDeleteResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryDeleteResponse>,
+            tonic::Status,
+        >;
         /// Look up a repository by id or by name.
         async fn repository_get(
             &self,
             request: tonic::Request<super::RepositoryGetRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryGetResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryGetResponse>,
+            tonic::Status,
+        >;
         /// Server streaming response type for the RepositoryList method.
         type RepositoryListStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::RepositoryListResponse, tonic::Status>,
-            > + std::marker::Send
+            >
+            + std::marker::Send
             + 'static;
         /// Stream all repositories the caller is authorised to see.
         async fn repository_list(
             &self,
             request: tonic::Request<super::RepositoryListRequest>,
-        ) -> std::result::Result<tonic::Response<Self::RepositoryListStream>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<Self::RepositoryListStream>,
+            tonic::Status,
+        >;
         /// Cheap hash-only read of a repository's current metadata pointer.
         async fn repository_metadata_get(
             &self,
             request: tonic::Request<super::RepositoryMetadataGetRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryMetadataGetResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryMetadataGetResponse>,
+            tonic::Status,
+        >;
         /// Compare-and-swap update of a repository's metadata pointer. CAS miss is
         /// signalled in-band via the response, never as a non-OK gRPC status.
         async fn repository_metadata_set(
             &self,
             request: tonic::Request<super::RepositoryMetadataSetRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryMetadataSetResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryMetadataSetResponse>,
+            tonic::Status,
+        >;
     }
     /// Baseline repository-management service. Carries the lifecycle and
     /// metadata-pointer primitives — repository create / delete, lookup, list,
@@ -594,7 +672,10 @@ pub mod repository_service_server {
                 max_encoding_message_size: None,
             }
         }
-        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
         where
             F: tonic::service::Interceptor,
         {
@@ -649,19 +730,23 @@ pub mod repository_service_server {
                 "/lore.repository.v1.RepositoryService/RepositoryCreate" => {
                     #[allow(non_camel_case_types)]
                     struct RepositoryCreateSvc<T: RepositoryService>(pub Arc<T>);
-                    impl<T: RepositoryService>
-                        tonic::server::UnaryService<super::RepositoryCreateRequest>
-                        for RepositoryCreateSvc<T>
-                    {
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::UnaryService<super::RepositoryCreateRequest>
+                    for RepositoryCreateSvc<T> {
                         type Response = super::RepositoryCreateResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::RepositoryCreateRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as RepositoryService>::repository_create(&inner, request).await
+                                <T as RepositoryService>::repository_create(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -691,19 +776,23 @@ pub mod repository_service_server {
                 "/lore.repository.v1.RepositoryService/RepositoryDelete" => {
                     #[allow(non_camel_case_types)]
                     struct RepositoryDeleteSvc<T: RepositoryService>(pub Arc<T>);
-                    impl<T: RepositoryService>
-                        tonic::server::UnaryService<super::RepositoryDeleteRequest>
-                        for RepositoryDeleteSvc<T>
-                    {
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::UnaryService<super::RepositoryDeleteRequest>
+                    for RepositoryDeleteSvc<T> {
                         type Response = super::RepositoryDeleteResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::RepositoryDeleteRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as RepositoryService>::repository_delete(&inner, request).await
+                                <T as RepositoryService>::repository_delete(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -733,19 +822,23 @@ pub mod repository_service_server {
                 "/lore.repository.v1.RepositoryService/RepositoryGet" => {
                     #[allow(non_camel_case_types)]
                     struct RepositoryGetSvc<T: RepositoryService>(pub Arc<T>);
-                    impl<T: RepositoryService>
-                        tonic::server::UnaryService<super::RepositoryGetRequest>
-                        for RepositoryGetSvc<T>
-                    {
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::UnaryService<super::RepositoryGetRequest>
+                    for RepositoryGetSvc<T> {
                         type Response = super::RepositoryGetResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::RepositoryGetRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as RepositoryService>::repository_get(&inner, request).await
+                                <T as RepositoryService>::repository_get(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -775,21 +868,24 @@ pub mod repository_service_server {
                 "/lore.repository.v1.RepositoryService/RepositoryList" => {
                     #[allow(non_camel_case_types)]
                     struct RepositoryListSvc<T: RepositoryService>(pub Arc<T>);
-                    impl<T: RepositoryService>
-                        tonic::server::ServerStreamingService<super::RepositoryListRequest>
-                        for RepositoryListSvc<T>
-                    {
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::ServerStreamingService<super::RepositoryListRequest>
+                    for RepositoryListSvc<T> {
                         type Response = super::RepositoryListResponse;
                         type ResponseStream = T::RepositoryListStream;
-                        type Future =
-                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::RepositoryListRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as RepositoryService>::repository_list(&inner, request).await
+                                <T as RepositoryService>::repository_list(&inner, request)
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -819,19 +915,25 @@ pub mod repository_service_server {
                 "/lore.repository.v1.RepositoryService/RepositoryMetadataGet" => {
                     #[allow(non_camel_case_types)]
                     struct RepositoryMetadataGetSvc<T: RepositoryService>(pub Arc<T>);
-                    impl<T: RepositoryService>
-                        tonic::server::UnaryService<super::RepositoryMetadataGetRequest>
-                        for RepositoryMetadataGetSvc<T>
-                    {
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::UnaryService<super::RepositoryMetadataGetRequest>
+                    for RepositoryMetadataGetSvc<T> {
                         type Response = super::RepositoryMetadataGetResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::RepositoryMetadataGetRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as RepositoryService>::repository_metadata_get(&inner, request)
+                                <T as RepositoryService>::repository_metadata_get(
+                                        &inner,
+                                        request,
+                                    )
                                     .await
                             };
                             Box::pin(fut)
@@ -862,19 +964,25 @@ pub mod repository_service_server {
                 "/lore.repository.v1.RepositoryService/RepositoryMetadataSet" => {
                     #[allow(non_camel_case_types)]
                     struct RepositoryMetadataSetSvc<T: RepositoryService>(pub Arc<T>);
-                    impl<T: RepositoryService>
-                        tonic::server::UnaryService<super::RepositoryMetadataSetRequest>
-                        for RepositoryMetadataSetSvc<T>
-                    {
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::UnaryService<super::RepositoryMetadataSetRequest>
+                    for RepositoryMetadataSetSvc<T> {
                         type Response = super::RepositoryMetadataSetResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::RepositoryMetadataSetRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as RepositoryService>::repository_metadata_set(&inner, request)
+                                <T as RepositoryService>::repository_metadata_set(
+                                        &inner,
+                                        request,
+                                    )
                                     .await
                             };
                             Box::pin(fut)
@@ -902,19 +1010,25 @@ pub mod repository_service_server {
                     };
                     Box::pin(fut)
                 }
-                _ => Box::pin(async move {
-                    let mut response = http::Response::new(tonic::body::Body::default());
-                    let headers = response.headers_mut();
-                    headers.insert(
-                        tonic::Status::GRPC_STATUS,
-                        (tonic::Code::Unimplemented as i32).into(),
-                    );
-                    headers.insert(
-                        http::header::CONTENT_TYPE,
-                        tonic::metadata::GRPC_CONTENT_TYPE,
-                    );
-                    Ok(response)
-                }),
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
             }
         }
     }
@@ -943,10 +1057,10 @@ pub mod forwarded_repository_service_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value
+        clippy::let_unit_value,
     )]
-    use tonic::codegen::http::Uri;
     use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
     /// A service to receive requests forwarded on from another Lore Server,
     /// to perform an RPC on behalf of a client
     #[derive(Debug, Clone)]
@@ -987,15 +1101,18 @@ pub mod forwarded_repository_service_client {
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
             T: tonic::codegen::Service<
-                    http::Request<tonic::body::Body>,
-                    Response = http::Response<
-                        <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
-                    >,
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
                 >,
-            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
-                Into<StdError> + std::marker::Send + std::marker::Sync,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
         {
-            ForwardedRepositoryServiceClient::new(InterceptedService::new(inner, interceptor))
+            ForwardedRepositoryServiceClient::new(
+                InterceptedService::new(inner, interceptor),
+            )
         }
         /// Compress requests with the given encoding.
         ///
@@ -1031,39 +1148,59 @@ pub mod forwarded_repository_service_client {
         pub async fn repository_create(
             &mut self,
             request: impl tonic::IntoRequest<super::RepositoryCreateRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryCreateResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryCreateResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/lore.repository.v1.ForwardedRepositoryService/RepositoryCreate",
             );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "lore.repository.v1.ForwardedRepositoryService",
-                "RepositoryCreate",
-            ));
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.ForwardedRepositoryService",
+                        "RepositoryCreate",
+                    ),
+                );
             self.inner.unary(req, path, codec).await
         }
         pub async fn repository_get(
             &mut self,
             request: impl tonic::IntoRequest<super::RepositoryGetRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryGetResponse>, tonic::Status>
-        {
-            self.inner.ready().await.map_err(|e| {
-                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
-            })?;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryGetResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/lore.repository.v1.ForwardedRepositoryService/RepositoryGet",
             );
             let mut req = request.into_request();
-            req.extensions_mut().insert(GrpcMethod::new(
-                "lore.repository.v1.ForwardedRepositoryService",
-                "RepositoryGet",
-            ));
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.ForwardedRepositoryService",
+                        "RepositoryGet",
+                    ),
+                );
             self.inner.unary(req, path, codec).await
         }
     }
@@ -1075,7 +1212,7 @@ pub mod forwarded_repository_service_server {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value
+        clippy::let_unit_value,
     )]
     use tonic::codegen::*;
     /// Generated trait containing gRPC methods that should be implemented for use with ForwardedRepositoryServiceServer.
@@ -1084,11 +1221,17 @@ pub mod forwarded_repository_service_server {
         async fn repository_create(
             &self,
             request: tonic::Request<super::RepositoryCreateRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryCreateResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryCreateResponse>,
+            tonic::Status,
+        >;
         async fn repository_get(
             &self,
             request: tonic::Request<super::RepositoryGetRequest>,
-        ) -> std::result::Result<tonic::Response<super::RepositoryGetResponse>, tonic::Status>;
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryGetResponse>,
+            tonic::Status,
+        >;
     }
     /// A service to receive requests forwarded on from another Lore Server,
     /// to perform an RPC on behalf of a client
@@ -1113,7 +1256,10 @@ pub mod forwarded_repository_service_server {
                 max_encoding_message_size: None,
             }
         }
-        pub fn with_interceptor<F>(inner: T, interceptor: F) -> InterceptedService<Self, F>
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
         where
             F: tonic::service::Interceptor,
         {
@@ -1148,7 +1294,8 @@ pub mod forwarded_repository_service_server {
             self
         }
     }
-    impl<T, B> tonic::codegen::Service<http::Request<B>> for ForwardedRepositoryServiceServer<T>
+    impl<T, B> tonic::codegen::Service<http::Request<B>>
+    for ForwardedRepositoryServiceServer<T>
     where
         T: ForwardedRepositoryService,
         B: Body + std::marker::Send + 'static,
@@ -1167,13 +1314,18 @@ pub mod forwarded_repository_service_server {
             match req.uri().path() {
                 "/lore.repository.v1.ForwardedRepositoryService/RepositoryCreate" => {
                     #[allow(non_camel_case_types)]
-                    struct RepositoryCreateSvc<T: ForwardedRepositoryService>(pub Arc<T>);
-                    impl<T: ForwardedRepositoryService>
-                        tonic::server::UnaryService<super::RepositoryCreateRequest>
-                        for RepositoryCreateSvc<T>
-                    {
+                    struct RepositoryCreateSvc<T: ForwardedRepositoryService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: ForwardedRepositoryService,
+                    > tonic::server::UnaryService<super::RepositoryCreateRequest>
+                    for RepositoryCreateSvc<T> {
                         type Response = super::RepositoryCreateResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::RepositoryCreateRequest>,
@@ -1181,9 +1333,10 @@ pub mod forwarded_repository_service_server {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
                                 <T as ForwardedRepositoryService>::repository_create(
-                                    &inner, request,
-                                )
-                                .await
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
                             };
                             Box::pin(fut)
                         }
@@ -1213,19 +1366,25 @@ pub mod forwarded_repository_service_server {
                 "/lore.repository.v1.ForwardedRepositoryService/RepositoryGet" => {
                     #[allow(non_camel_case_types)]
                     struct RepositoryGetSvc<T: ForwardedRepositoryService>(pub Arc<T>);
-                    impl<T: ForwardedRepositoryService>
-                        tonic::server::UnaryService<super::RepositoryGetRequest>
-                        for RepositoryGetSvc<T>
-                    {
+                    impl<
+                        T: ForwardedRepositoryService,
+                    > tonic::server::UnaryService<super::RepositoryGetRequest>
+                    for RepositoryGetSvc<T> {
                         type Response = super::RepositoryGetResponse;
-                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
                         fn call(
                             &mut self,
                             request: tonic::Request<super::RepositoryGetRequest>,
                         ) -> Self::Future {
                             let inner = Arc::clone(&self.0);
                             let fut = async move {
-                                <T as ForwardedRepositoryService>::repository_get(&inner, request)
+                                <T as ForwardedRepositoryService>::repository_get(
+                                        &inner,
+                                        request,
+                                    )
                                     .await
                             };
                             Box::pin(fut)
@@ -1253,19 +1412,25 @@ pub mod forwarded_repository_service_server {
                     };
                     Box::pin(fut)
                 }
-                _ => Box::pin(async move {
-                    let mut response = http::Response::new(tonic::body::Body::default());
-                    let headers = response.headers_mut();
-                    headers.insert(
-                        tonic::Status::GRPC_STATUS,
-                        (tonic::Code::Unimplemented as i32).into(),
-                    );
-                    headers.insert(
-                        http::header::CONTENT_TYPE,
-                        tonic::metadata::GRPC_CONTENT_TYPE,
-                    );
-                    Ok(response)
-                }),
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
             }
         }
     }
