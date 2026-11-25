@@ -11,7 +11,8 @@ use lore_proto::lore::repository::v1::RepositoryListResponse;
 use lore_proto::lore::repository::v1::RepositoryTextMetadata;
 use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
-use lore_revision::metadata::{Metadata, MetadataType};
+use lore_revision::metadata::Metadata;
+use lore_revision::metadata::MetadataType;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use tokio::sync::mpsc;
@@ -137,6 +138,7 @@ pub async fn handler(
 }
 
 /// Build one authorized repository record from one decoded metadata blob.
+/// Candidates with no repository metadata pointer are skipped.
 /// Unfiltered listings skip unreadable metadata. Filtered listings emit an
 /// unavailable status, since a failed read cannot establish a negative match.
 /// A store asking the caller to back off always emits its status.
@@ -159,6 +161,7 @@ async fn load_and_filter_repository(
     {
         Err(status) => return Some(Err(status)),
         Ok(Ok(hash)) => hash,
+        Ok(Err(err)) if err.is_address_not_found() => return None,
         Ok(Err(err)) => {
             debug!(%id, %err, "Repository list: metadata hash unavailable");
             return text_filter

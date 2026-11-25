@@ -50,9 +50,12 @@ native default branch.
 explicit native match. A filtered response includes initial gRPC metadata
 `lore-repository-text-filter: 1`, including an empty result. Clients requiring the
 filter must check both the support header and each result's echo; an older server
-that ignores new protobuf fields must not broaden discovery. Unreadable candidate
+that ignores new protobuf fields must not broaden discovery. A catalog candidate
+whose initial repository metadata-pointer lookup returns typed `AddressNotFound`
+is absent and is skipped. Once that pointer exists, unreadable or malformed
 metadata makes a filtered stream unavailable rather than claiming exhaustion.
-Unfiltered calls preserve existing skip/error and visibility behavior.
+Other pointer lookup errors also remain unavailable. Unfiltered calls preserve
+existing skip/error and visibility behavior.
 
 ## Compatibility
 
@@ -128,7 +131,8 @@ query shape to one typed native metadata entry and adds explicit support evidenc
 ## Validation
 
 Native in-memory store tests cover exact text, case/type mismatch, missing keys,
-creator conjunction, unreadable metadata, authorized subsets, plain listing,
+creator conjunction, granted but uncreated repositories, missing referenced
+metadata blobs, malformed metadata, pointer read failures, authorized subsets, plain listing,
 filter bounds and an empty supported stream. Client tests must reject absent support
 and incorrect echoes before adopting the new filtered API. The relevant native
 [handler](../../lore-server/src/grpc/repository/v1/repository_list.rs),
